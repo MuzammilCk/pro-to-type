@@ -6,9 +6,23 @@ decides whether to enroll or alert. Three concurrent threads, no blocking.
 ## Quick Start
 ```bash
 pip install -r requirements.txt
+python setup_models.py   # fetches gitignored model files into models/
 python run.py
 # Keys: 1=Webcam 2=Phone 3=File 4=IPCAM | Q=Quit
 ```
+
+## Face Pattern HUD
+Unrecognized visitors get a MediaPipe Face Landmarker mesh drawn over their
+actual face boundary (contours style); the moment a face is recognized the
+pattern disappears automatically. Tunables (env vars):
+
+```bash
+ARIA_PATTERN_STYLE=contours   # contours | tesselation (denser wireframe look)
+ARIA_PATTERN_EVERY=2          # re-infer every Nth frame (higher = cheaper)
+ARIA_PATTERN_MAX_FACES=4      # simultaneous meshes
+```
+Requires `mediapipe` (auto-installed via requirements.txt) and
+`models/face_landmarker.task` (fetched by `setup_models.py`).
 
 ## Architecture (Full-Duplex)
 ```

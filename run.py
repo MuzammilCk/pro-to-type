@@ -33,6 +33,7 @@ from detector import Detector
 from reasoner import Reasoner
 from alerter import Alerter
 from face_engine import FaceEngine
+from face_pattern import FacePatternEngine
 from tracker import FaceTracker
 from presence import PresenceManager
 from input_source import InputManager, WebcamSource, IPCameraSource, FileSource
@@ -102,6 +103,12 @@ class VisionAgentApp:
         self.tracker = FaceTracker(self.face_engine)
         self.presence = PresenceManager(self.vision_events)
 
+        # Landmark pattern renderer (ARIA_FACE_PATTERN_UPGRADE.md): visual-only
+        # component that draws a MediaPipe landmark mesh on UNRECOGNIZED faces.
+        # It reads the tracker's existing authorized status — no new state.
+        self.pattern_engine = FacePatternEngine()
+        self._frame_idx = 0
+
     def run(self):
         cv2.namedWindow("ARIA — Full-Duplex Vision Agent")
         cv2.setMouseCallback("ARIA — Full-Duplex Vision Agent",
@@ -170,6 +177,16 @@ class VisionAgentApp:
 
             # Clean up lost faces
             self.tracker.cleanup_left_faces()
+
+            # Landmark pattern (visual-only): analyze every frame (internally
+            # throttled per track), render on unrecognized faces only. When a
+            # face becomes recognized the pattern stops drawing immediately.
+            unrecognized = [fr for fr in face_results if not fr["authorized"]]
+            self.pattern_engine.analyze(frame, unrecognized, self._frame_idx)
+            for fr in unrecognized:
+                self.pattern_engine.draw(frame, fr["track_id"])
+            self.pattern_engine.prune({fr["track_id"] for fr in face_results})
+            self._frame_idx += 1
 
             # Render
             for d in detections:
@@ -433,16 +450,20 @@ class VisionAgentApp:
     # ------------------------------------------------------------------
 
     def _draw_face(self, frame, fr):
-        color = (0, 255, 0) if fr["authorized"] else (0, 0, 255)
         x, y, w, h = fr["face_bbox"]
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        if fr.get("landmarks"):
-            pts = np.array(fr["landmarks"]).reshape(-1, 2)
-            for px, py in pts:
-                cv2.circle(frame, (int(px), int(py)), 3, color, -1)
-        label = f"{fr['identity']} ({fr['distance']:.2f})"
-        cv2.putText(frame, label, (x, y + h + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        if fr["authorized"]:
+            # Recognized: keep the classic green box + name label.
+            color = (0, 255, 0)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            label = f"{fr['identity']} ({fr['distance']:.2f})"
+            cv2.putText(frame, label, (x, y + h + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        else:
+            # Unrecognized: the MediaPipe landmark pattern IS the face marker
+            # (drawn just above by pattern_engine). No rectangle — the mesh
+            # follows the actual face boundary instead.
+            cv2.putText(frame, "UNRECOGNIZED — SCAN ACTIVE", (x, y + h + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
     def _render(self, frame, decision):
         frame_disp = frame.copy()

@@ -89,8 +89,6 @@ class FaceEngine:
         # Blur threshold: 100 is typical cutoff (variance of Laplacian)
         blur_score = min(1.0, blur / 100.0) if blur > 0 else 0.0
         return min(1.0, 0.4 * size_score + 0.3 * conf_score + 0.3 * blur_score)
-        conf_score = max(0.5, min(1.0, confidence))
-        return min(1.0, 0.5 * size_score + 0.5 * conf_score)
 
     def detect(self, frame: np.ndarray, min_size: int = MIN_FACE_SIZE) -> np.ndarray:
         h, w = frame.shape[:2]
