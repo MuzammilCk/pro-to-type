@@ -33,6 +33,8 @@ from detector import Detector
 from reasoner import Reasoner
 from alerter import Alerter
 from face_engine import FaceEngine
+from tracker import FaceTracker
+from presence import PresenceManager
 from input_source import InputManager, WebcamSource, IPCameraSource, FileSource
 from conversation import ConversationManager
 from agent import VisionAgent
@@ -45,6 +47,17 @@ CONFIG = {
     "phone_url": os.getenv("PHONE_CAM_URL", ""),
     "ipcam_url": os.getenv("IP_CAM_URL", ""),
     "file_source": os.getenv("VIDEO_SOURCE", "samples/face_test.jpg"),
+}
+
+# Words that mean "no" — anything else is treated as consent to enroll
+_REFUSAL_WORDS = {"no", "nope", "nah", "never", "later", "not", "don't", "dont", "leave", "stop", "privacy"}
+
+# Placeholder names that must never be enrolled as a person's identity
+_INVALID_NAMES = {
+    "", "unknown", "uh", "um", "my", "i", "the", "name", "is", "it's", "its",
+    "im", "i'm", "this", "yes", "yeah", "yep", "ok", "okay", "sure", "thanks",
+    "thank", "hello", "hi", "hey", "no", "not", "don't", "dont", "sorry",
+    "very", "just", "so", "really", "here", "called", "and", "but",
 }
 
 
@@ -85,9 +98,9 @@ class VisionAgentApp:
         self._latest_decision = None
         self._status_text = ""
 
-        # Face tracking — prevents re-greeting identified faces
-        self._face_trackers: dict[str, dict] = {}
-        self._greeted_identities: set = set()
+        # Face tracking + presence management (architecture: separate seeing from thinking)
+        self.tracker = FaceTracker(self.face_engine)
+        self.presence = PresenceManager(self.vision_events)
 
     def run(self):
         cv2.namedWindow("ARIA — Full-Duplex Vision Agent")
@@ -124,7 +137,14 @@ class VisionAgentApp:
         cv2.destroyAllWindows()
 
     def _vision_loop(self):
-        """Continuously captures + analyzes frames, sends events to conversation."""
+        """Continuously captures + analyzes frames using tracker + presence manager.
+
+        Architecture (per ARIA_ARCHITECTURE.md): OpenCV does ALL seeing.
+        - YOLO detects people (visualization + awareness)
+        - FaceEngine detects faces (downscaled for CPU speed)
+        - FaceTracker matches faces frame-to-frame, skips redundant recognition
+        - PresenceManager emits clean, de-duplicated state-transition events
+        """
         fps_buf = []
         while not self._stop.is_set():
             ret, frame = self.manager.read()
@@ -133,10 +153,25 @@ class VisionAgentApp:
                 continue
 
             t0 = time.perf_counter()
-            detections = self.detector.detect(frame)
-            decision = self.reasoner.evaluate(detections, frame)
-            face_results = decision.get("face_results", [])
 
+            # YOLO object detection (people, objects) — for visualization
+            detections = self.detector.detect(frame)
+
+            # Face tracking (with frame-skipping + downscale)
+            face_results = self.tracker.update(frame, downscale_factor=0.5)
+
+            # Run recognition only on faces that need it (new or stale tracks)
+            if any(fr.get("needs_recognition") for fr in face_results):
+                self.tracker.recognize_faces(frame)
+                face_results = self.tracker.update_results()
+
+            # Presence: emit de-duplicated events (person_entered, person_recognized, etc.)
+            self.presence.update(face_results)
+
+            # Clean up lost faces
+            self.tracker.cleanup_left_faces()
+
+            # Render
             for d in detections:
                 self.detector.draw(frame, d)
             for fr in face_results:
@@ -146,26 +181,15 @@ class VisionAgentApp:
             if len(fps_buf) > 30:
                 fps_buf.pop(0)
             avg_dt = sum(fps_buf) / len(fps_buf) if fps_buf else 0.1
-            self._status_text = f"{1/avg_dt:.1f} FPS | faces={len(face_results)} | act={decision['should_act']}"
+            self._status_text = f"{1/avg_dt:.1f} FPS | faces={len(face_results)} | tracks={self.tracker.track_count}"
 
             with self._frame_lock:
                 self._latest_frame = frame
-                self._latest_decision = decision
-
-            # --- Vision → Conversation signal ---
-            # Send event for unknown faces not yet greeted, and skip low-quality/blurry faces
-            for fr in face_results:
-                if not fr["authorized"]:
-                    person_key = fr["identity"]
-                    already_greeted = self._check_greeted(person_key, face_results)
-                    if not already_greeted and fr.get("quality", 0) >= 0.3:
-                        self.vision_events.put({
-                            "type": "unknown_visitor",
-                            "identity": "unknown",
-                            "timestamp": time.time(),
-                            "face_bbox": fr["face_bbox"],
-                            "score": fr["distance"],
-                        })
+                self._latest_decision = {
+                    "face_results": face_results,
+                    "should_act": any(not fr["authorized"] for fr in face_results),
+                    "total": len(detections),
+                }
 
             # Periodic frame summary (every 3s)
             now = time.time()
@@ -181,26 +205,134 @@ class VisionAgentApp:
             else:
                 self._last_summary_time = now
 
-    def _check_greeted(self, identity: str, face_results: list) -> bool:
-        recent = list(self.vision_events.queue)[-5:]
-        for evt in reversed(recent):
-            if evt.get("type") == "unknown_visitor" and evt.get("identity") == identity:
-                if time.time() - evt.get("timestamp", 0) < 15:
-                    return True
-        return False
+    # ------------------------------------------------------------------
+    # Shared conversation helpers
+    # ------------------------------------------------------------------
+
+    def _speak(self, text: str):
+        """Speak and actually wait for playback to finish.
+
+        Every caller previously used speak_async + a guessed sleep, which is
+        how the greeting got cut off and how TTS overlapped with listen().
+        """
+        if text and text.strip():
+            self.voice.speak(text)
+
+    def _latest_frame_now(self):
+        with self._frame_lock:
+            return self._latest_frame.copy() if self._latest_frame is not None else None
+
+    def _latest_stable_face(self, min_quality: float = 0.4):
+        """Return (frame, face) for the current best visible face, or (None, None).
+
+        Requires the same face to be detected on two consecutive quick reads —
+        guards against enrolling someone from a transient/partial frame.
+        """
+        for _ in range(2):
+            frame = self._latest_frame_now()
+            if frame is None:
+                time.sleep(0.2)
+                continue
+            faces = self.face_engine.detect(frame)
+            if len(faces) == 0:
+                time.sleep(0.4)
+                continue
+            face = max(faces, key=lambda f: f[2] * f[3])
+            quality = self.face_engine._face_quality(face, frame)
+            if quality >= min_quality:
+                return frame, face
+            time.sleep(0.4)
+        return None, None
+
+    @staticmethod
+    def _extract_name(utterance: str) -> str | None:
+        """Pull a plausible person name out of a raw utterance, or None.
+
+        B3 fix: never enroll "Hey" (first token) or "my name is" (pre-name
+        filler) as someone's identity.
+        """
+        text = (utterance or "").strip().strip(".,!?").strip()
+        if not text:
+            return None
+        low = text.lower()
+
+        for marker in ("my name is", "i am called", "call me", "i'm", "im", "i am", "this is"):
+            if marker in low:
+                tail = text[low.index(marker) + len(marker):].strip(" .,!?")
+                words = [w for w in tail.split() if w.strip(" .,!?")]
+                # Skip filler words and capitalized markers embedded in phrases
+                while words and words[0].lower().strip(" .,!?") in _INVALID_NAMES | {"a", "an", "just", "called"}:
+                    words.pop(0)
+                if words:
+                    return words[0].strip(" .,!?")
+                return None
+
+        # No marker: accept a lone word as the name only if it isn't filler
+        words = text.split()
+        if len(words) == 1 and words[0].lower() not in _INVALID_NAMES:
+            return words[0]
+        return None
+
+    def _enroll_with_name(self, conv: ConversationManager, name: str, face_data: dict):
+        """Enroll the visitor under `name`, capturing templates from FRESH frames.
+
+        B4 fix: the old code embedded the SAME frame three times, producing
+        three near-identical templates — useless for multi-angle robustness.
+        Each capture here re-reads the live camera and skips near-duplicates.
+        """
+        for attempt in range(3):
+            frame, face = self._latest_stable_face()
+            if frame is not None and face is not None:
+                emb = self.face_engine.embed(frame, face)
+                if emb is not None and len(emb) > 0:
+                    # Skip templates that are near-identical to ones we already have
+                    existing = self.face_engine.known_faces.get(name, [])
+                    if not any(float(np.dot(emb, e)) > 0.995 for e in existing):
+                        self.face_engine.add_template(name, emb)
+                        time.sleep(0.8)  # let the person move naturally between captures
+                    break
+            time.sleep(0.5)
+
+        templates = len(self.face_engine.known_faces.get(name, []))
+        if templates == 0:
+            self._speak("I couldn't get a clear look at your face. Let's try that again in a moment.")
+            conv.reset()
+            return
+
+        self.reasoner.set_authorized(set(self.face_engine.known_faces.keys()))
+
+        mem = self.agent._memory_for(name)
+        mem.persona.name = name
+        mem.persona.relationship_tier = "trusted"
+        mem.persona.purpose = face_data.get("purpose") or "enrolled visitor"
+        mem.persona.tags.append("enrolled")
+        mem.add_interaction("system", f"Enrolled as {name} with {templates} templates")
+        mem.save()
+
+        self.memory[name] = mem
+        # If we had been talking to this person under a generic identity, merge forward
+        if conv.current_identity and conv.current_identity in self.agent.memory and conv.current_identity != name:
+            del self.agent.memory[conv.current_identity]
+        conv.current_identity = name
+
+        conv.reset()
+        self._speak(f"Pleased to meet you, {name}! You're now authorized — I'll recognize you next time.")
+
+    # ------------------------------------------------------------------
+    # Conversation loop
+    # ------------------------------------------------------------------
 
     def _conversation_loop(self):
-        """Consumes vision events, drives conversation via voice + LLM.
+        """Consumes presence events, drives conversation via voice + LLM.
 
-        Uses ConversationManager for state machine + agent.think/think_stream
-        for LLM reasoning. Vision events are event-driven (not per-frame).
+        Events from PresenceManager: person_entered, person_recognized,
+        person_unrecognized, person_left.
+        Uses ConversationManager for state machine + agent for LLM reasoning.
         """
         conv = ConversationManager(
             self.agent, self.voice, self.face_engine,
             vision_queue=self.action_events,
-            frame_provider=lambda: (
-                self._latest_frame.copy() if self._latest_frame is not None else None
-            ),
+            frame_provider=self._latest_frame_now,
         )
 
         while not self._stop.is_set():
@@ -209,91 +341,96 @@ class VisionAgentApp:
             except queue.Empty:
                 continue
 
-            if event["type"] == "unknown_visitor":
+            evt_type = event.get("type", "")
+
+            if evt_type == "person_recognized":
+                # B5 fix: greet known people, then LISTEN — they get a dialogue,
+                # not a monologue followed by silence.
+                name = event.get("name", "friend")
+                track_id = event.get("track_id", "")
+                face_data = {
+                    "authorized": True,
+                    "face_bbox": event.get("face_bbox", (0, 0, 0, 0)),
+                    "score": event.get("score", 0.0),
+                }
+                self.presence.mark_greeted(track_id)
+
+                response, action = self.agent.think(name, face_data)
+                self._speak(response)
+                self._dialogue_loop(conv, name, face_data)
+
+            elif evt_type == "person_unrecognized":
+                # B1 fix: the greeting is spoken exactly once. start_for only
+                # builds and returns the text now; playback happens here.
                 face_data = {
                     "authorized": False,
-                    "face_bbox": event["face_bbox"],
-                    "score": event.get("score", 0),
+                    "face_bbox": event.get("face_bbox", (0, 0, 0, 0)),
+                    "score": event.get("score", 0.0),
                 }
-                # Greet: start TTS async, then listen (barge-in interrupts TTS)
-                response = conv.start_for("unknown", face_data)
-                if response:
-                    self.voice.speak_async(response)
-                    # Wait briefly for TTS to start, then listen (barge-in)
-                    time.sleep(0.2)
+                self.presence.mark_greeted(event.get("track_id", ""))
 
-                # Listen loop: capture speech, pass to ConversationManager
-                while conv.state != "IDLE" and not self._stop.is_set():
-                    transcript = self.voice.listen(timeout=10, phrase_limit=8)
-                    if not transcript:
-                        if conv.state != "ENROLLING":
-                            conv.state = "IDLE"
-                            break
-                        continue
+                greeting = conv.start_for("unknown", face_data)
+                self._speak(greeting)
+                self._dialogue_loop(conv, "unknown", face_data)
 
-                    identity = conv.current_identity or "unknown"
-                    response, action = conv.handle_response(
-                        transcript, identity, face_data
-                    )
+            elif evt_type == "person_left":
+                conv.reset()
+                self.voice.speak_async("Goodbye! Come back soon.")
 
-                    if action == "enroll":
-                        conv.state = "ENROLLING"
-                        self._do_enrollment(conv, transcript)
-                    elif action == "alert":
-                        self.alerter.fire({
-                            "reason": "unknown_visitor_refused_enrollment",
-                            "transcript": transcript,
-                        })
-                        self.voice.speak_async("I'm escalating this to security.")
-                        conv.reset()
-
-            elif event["type"] == "frame_summary":
+            elif evt_type == "frame_summary":
                 self._status_text = (
                     f"Vision: {event['detections']} dets, "
                     f"{event['faces']} faces, "
                     f"{event['authorized']} authorized"
                 )
 
-    def _do_enrollment(self, conv: ConversationManager, name_hint: str):
-        """Capture multiple face samples and enroll the visitor."""
-        with self._frame_lock:
-            frame = self._latest_frame.copy() if self._latest_frame is not None else None
+    def _dialogue_loop(self, conv: ConversationManager, identity: str, face_data: dict):
+        """Shared listen/respond loop for recognized AND unknown visitors.
 
-        if frame is None:
-            conv.state = "IDLE"
-            return
+        B5 fix: recognized visitors previously never reached a listen() call,
+        so anything they said after the greeting fell into the void.
+        """
+        if conv.current_identity is None:
+            conv.current_identity = identity
 
-        faces = self.face_engine.detect(frame)
-        if len(faces) == 0:
-            self.voice.speak("I didn't catch a clear face. Please face the camera.")
-            return
+        while conv.state != "IDLE" and not self._stop.is_set():
+            transcript = self.voice.listen(timeout=12, phrase_limit=8)
+            if not transcript:
+                # No reply — end politely instead of hanging in the state machine
+                if conv.state != "ENROLLING":
+                    conv.reset()
+                    break
+                continue
 
-        name = name_hint.strip().split()[0] if name_hint else f"visitor_{int(time.time())}"
+            response, action = conv.handle_response(transcript, conv.current_identity, face_data)
 
-        # Multi-template enrollment: capture 3 embeddings for robustness
-        templates = 0
-        for _ in range(3):
-            emb = self.face_engine.embed(frame, faces[0])
-            if emb is not None and len(emb) > 0:
-                self.face_engine.add_template(name, emb)
-                templates += 1
+            if action == "enroll":
+                conv.state = "ENROLLING"
+                # B3 fix: derive the name from what they actually said; if we
+                # can't, ask instead of enrolling "Hey" as a person.
+                name = self._extract_name(transcript)
+                if name is None:
+                    self._speak("And what should I call you?")
+                    name_reply = self.voice.listen(timeout=8, phrase_limit=5)
+                    name = self._extract_name(name_reply or "")
+                if name is None:
+                    self._speak("No worries — we can skip that for now.")
+                    conv.reset()
+                else:
+                    face_data["purpose"] = transcript
+                    self._enroll_with_name(conv, name, face_data)
+                break
+            elif action == "alert":
+                self.alerter.fire({
+                    "reason": "unknown_visitor_refused_enrollment",
+                    "transcript": transcript,
+                })
+                self.voice.speak_async("I'm escalating this to security.")
+                conv.reset()
+                break
+            # action == "ask": loop continues — listen for their next line
 
-        self.reasoner.set_authorized(set(self.face_engine.known_faces.keys()))
-
-        mem = self.agent._memory_for(name)
-        mem.persona.name = name
-        mem.persona.relationship_tier = "trusted"
-        mem.persona.purpose = "enrolled visitor"
-        mem.persona.tags.append("enrolled")
-        mem.add_interaction("system", f"Enrolled as {name} with {templates} templates")
-        mem.save()
-
-        self.memory[name] = mem
-        if name in self.agent.memory:
-            del self.agent.memory[name]
-
-        conv.reset()
-        self.voice.speak(f"Pleased to meet you, {name}! You're now authorized with {templates} face samples.")
+    # ------------------------------------------------------------------
 
     def _draw_face(self, frame, fr):
         color = (0, 255, 0) if fr["authorized"] else (0, 0, 255)

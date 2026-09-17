@@ -58,12 +58,12 @@ class SarvamVoice:
         self.api_key = api_key or _SARVAM_KEY
         self.lang = os.getenv("SARVAM_LANG", DEFAULT_LANG)
         self._interrupt_flag = threading.Event()
+        self._tts_gen = 0  # generation counter — bumped on interrupt/new utterance
         self._tts_thread: threading.Thread | None = None
         self._last_transcript = queue.Queue(maxsize=1)
 
-    @property
     def available(self) -> bool:
-        return self.api_key is not None and _HAS_WS and _HAS_SOUND
+        return self.api_key is not None and _HAS_WS
 
     # --- STT (Saaras) ---
 
@@ -73,12 +73,12 @@ class SarvamVoice:
         Supports barge-in: if TTS is playing, it is interrupted first.
         Falls back to local speech_recognition or keyboard if Sarvam unavailable.
         """
-        self._interrupt_flag.set()  # Signal TTS to stop (barge-in)
+        self.interrupt()  # Barge-in: bump generation so in-flight TTS aborts
         if self._tts_thread is not None and self._tts_thread.is_alive():
             self._tts_thread.join(timeout=0.5)
         self._interrupt_flag.clear()
         self._tts_thread = None
-        if self.available:
+        if self.available():
             return self._listen_sarvam(timeout, phrase_limit)
         elif _HAS_STT_LOCAL:
             return self._listen_local()
@@ -91,7 +91,10 @@ class SarvamVoice:
 
         async def _run():
             headers = {"api-subscription-key": self.api_key}
-            async with websockets.connect(_SARVAM_STT_WS, extra_headers=headers) as ws:
+            connect_kwargs = {"additional_headers": headers}
+            if websockets.__version__ < "13.0":
+                connect_kwargs = {"extra_headers": headers}
+            async with websockets.connect(_SARVAM_STT_WS, **connect_kwargs) as ws:
                 await ws.send(json.dumps({"config": {"model": "saaras:v2.1", "language_code": self.lang}}))
 
                 stop_rec = threading.Event()
@@ -143,17 +146,31 @@ class SarvamVoice:
             return self._listen_keyboard()
 
     def _listen_local(self) -> str:
-        """Local fallback using speech_recognition + Google Web API."""
-        if not _HAS_STT_LOCAL:
-            return ""
-        r = sr.Recognizer()
-        with sr.Microphone() as source:
-            r.adjust_for_ambient_noise(source, duration=0.5)
-            try:
-                audio = r.listen(source, timeout=5, phrase_time_limit=8)
-                return r.recognize_google(audio)
-            except Exception:
-                return self._listen_keyboard()
+        """Local fallback using sounddevice for audio capture (no pyaudio needed).
+
+        Records audio at 16kHz mono via sounddevice, then transcribes via
+        Google Web Speech API through speech_recognition's AudioData.
+        """
+        if not _HAS_STT_LOCAL or not _HAS_SOUND:
+            return self._listen_keyboard()
+
+        try:
+            import speech_recognition as sr
+        except ImportError:
+            return self._listen_keyboard()
+
+        sample_rate = 16000
+        duration = 8.0
+
+        frames = sd.rec(int(duration * sample_rate), samplerate=sample_rate,
+                        channels=1, dtype="int16")
+        sd.wait()
+
+        audio = sr.AudioData(frames.tobytes(), sample_rate, 2)
+        try:
+            return sr.Recognizer().recognize_google(audio)
+        except Exception:
+            return self._listen_keyboard()
 
     def _listen_keyboard(self) -> str:
         """Keyboard fallback — type your reply and press Enter."""
@@ -165,37 +182,54 @@ class SarvamVoice:
     # --- TTS (Bulbul) ---
 
     def speak(self, text: str, interrupt: bool = True):
-        """Block until speech completes. Interrupt if interrupt=True."""
+        """Block until speech completes. Interrupt any older utterance first."""
         if interrupt:
             self.interrupt()
-        if self.available and text.strip():
-            self._speak_sarvam(text)
+        my_gen = self._tts_gen  # captured AFTER the interrupt bump
+        if self.available() and text.strip():
+            self._speak_sarvam(text, my_gen)
         elif _HAS_TTS_LOCAL:
             self._speak_local(text)
         else:
             print(f"[TTS] {text}")
 
     def speak_async(self, text: str) -> threading.Thread:
-        """Non-blocking speech output on a daemon thread."""
+        """Non-blocking speech output on a daemon thread.
+
+        Supersedes any in-flight utterance and waits briefly for the previous
+        speaker to wind down so two TTS streams never overlap.
+        """
+        self._tts_gen += 1
         self._interrupt_flag.clear()
-        t = threading.Thread(target=self.speak, args=(text,), daemon=True)
+        old = self._tts_thread
+        if old is not None and old.is_alive():
+            old.join(timeout=1.0)
+        t = threading.Thread(target=self.speak, args=(text, False), daemon=True)
         self._tts_thread = t
         t.start()
         return t
 
     def interrupt(self):
         """Signal ongoing STT/TTS to cut off (barge-in)."""
+        self._tts_gen += 1  # invalidates any speaker holding an older generation
         self._interrupt_flag.set()
 
-    def _speak_sarvam(self, text: str, voice: str = "meera", speed: float = 1.0):
+    def _speak_sarvam(self, text: str, my_gen: int | None = None,
+                      voice: str = "meera", speed: float = 1.0):
         """WebSocket streaming TTS with Bulbul.
 
-        Plays audio in chunks for interruptible barge-in support.
+        Blocks until playback finishes, aborting early if a newer utterance
+        supersedes this one (generation mismatch = barge-in).
         """
-        import time as _time
+        def _stale() -> bool:
+            return my_gen is not None and my_gen != self._tts_gen
+
         async def _run():
             headers = {"api-subscription-key": self.api_key}
-            async with websockets.connect(_SARVAM_TTS_WS, extra_headers=headers) as ws:
+            connect_kwargs = {"additional_headers": headers}
+            if websockets.__version__ < "13.0":
+                connect_kwargs = {"extra_headers": headers}
+            async with websockets.connect(_SARVAM_TTS_WS, **connect_kwargs) as ws:
                 msg = json.dumps({
                     "text": text,
                     "language_code": self.lang,
@@ -219,17 +253,18 @@ class SarvamVoice:
                         break
 
                 if all_audio and _HAS_SOUND:
-                    # Play in chunks — check interrupt between each chunk
+                    if _stale():
+                        return
                     audio = np.frombuffer(all_audio, dtype=np.int16)
-                    chunk_size = 1600  # ~100ms at 16kHz
-                    offset = 0
                     sd.play(audio, 16000)
-                    while offset < len(audio):
-                        if self._interrupt_flag.is_set():
+                    # Truly block until playback finishes (the old loop tracked
+                    # a fake offset and returned while audio was still playing,
+                    # which let the next listen() cut speech off mid-word).
+                    while sd.is_playing():
+                        if _stale():
                             sd.stop()
-                            break
+                            return
                         _time.sleep(0.05)
-                        offset += chunk_size
 
         try:
             asyncio.run(_run())

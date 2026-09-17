@@ -19,6 +19,7 @@ except ImportError:
     _HAS_OLLAMA = False
 
 from context_memory import PersonMemory
+from llm_interface import OpenRouterClient, LocalFallbackLLM, BedrockLLM, _HAS_BOTO3
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_MODELS = [
@@ -52,183 +53,30 @@ Respond with ONLY what should be spoken aloud. Do not include stage directions o
 """
 
 
-class OpenRouterClient:
-    """OpenRouter API client with streaming + provider routing + vision support.
-
-    Architecture per research: unified /chat/completions endpoint,
-    same for text/vision. Uses SSE streaming for real-time token output.
-    """
-
-    def __init__(self):
-        self.api_key = os.getenv("OPENROUTER_API_KEY")
-        self.referer = os.getenv("OPENROUTER_REFERER", "http://localhost:8080")
-        self.app_name = os.getenv("OPENROUTER_APP_NAME", "ARIA-Companion")
-        self.model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODELS[0])
-        self.fallback_models = [self.model] + [
-            m for m in DEFAULT_MODELS if m != self.model
-        ]
-
-    @property
-    def available(self) -> bool:
-        return self.api_key is not None
-
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": self.referer,
-            "X-Title": self.app_name,
-            "Content-Type": "application/json",
-        }
-
-    def _payload(self, messages: list[dict], stream: bool = True) -> dict:
-        is_free = ":free" in self.model
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": stream,
-            "max_tokens": 300,
-            "temperature": 0.7,
-        }
-        if not is_free:
-            payload["provider"] = {
-                "sort": "latency",
-                "allow_fallbacks": True,
-                "data_collection": "deny",
-            }
-        return payload
-
-    def _payload_with_image(self, text: str, image_b64: str,
-                            messages: list[dict] | None = None) -> dict:
-        msgs = messages or []
-        is_free = ":free" in self.model
-        payload = {
-            "model": self.model,
-            "messages": msgs + [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                ],
-            }],
-            "stream": True,
-            "max_tokens": 300,
-            "temperature": 0.5,
-        }
-        if not is_free:
-            payload["provider"] = {"sort": "latency", "allow_fallbacks": True}
-        return payload
-
-    def stream(self, messages: list[dict]) -> Iterator[str]:
-        """SSE streaming — yields tokens as they arrive (sub-100ms latency).
-
-        Retries with fallback models on rate limit or unavailable errors.
-        Handles SSE control lines (data: [DONE]) gracefully.
-        """
-        if not _HAS_HTTPX:
-            yield "Streaming requires httpx. Install: pip install httpx"
-            return
-
-        for model in self.fallback_models:
-            self.model = model
-            payload = self._payload(messages)
-            try:
-                with httpx.Client(timeout=30) as client:
-                    with client.stream("POST", f"{OPENROUTER_BASE}/chat/completions",
-                                       headers=self._headers(),
-                                       json=payload) as response:
-                        for line in response.iter_lines():
-                            if line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                if data_str == "[DONE]":
-                                    return  # Stream complete
-                                try:
-                                    data = json.loads(data_str)
-                                except json.JSONDecodeError:
-                                    continue
-                                if data.get("choices"):
-                                    delta = data["choices"][0].get("delta", {}).get("content", "")
-                                    if delta:
-                                        yield delta
-                return  # Success — exit retry loop
-            except (httpx.HTTPStatusError, KeyError, IndexError) as e:
-                print(f"[OpenRouter] Model {model} failed: {e}, trying fallback...")
-                time.sleep(1)
-                continue
-
-    def stream_with_image(self, text: str, frame, messages: list[dict] | None = None) -> Iterator[str]:
-        """Vision + streaming: send frame as base64 image with text prompt.
-
-        Retries with fallback models on rate limit or unavailable errors.
-        """
-        success, encoded = cv2.imencode(".jpg", frame)
-        if not success:
-            yield ""
-            return
-        b64 = base64.b64encode(encoded.tobytes()).decode("utf-8")
-
-        for model in self.fallback_models:
-            self.model = model
-            payload = self._payload_with_image(text, b64, messages)
-            try:
-                with httpx.Client(timeout=30) as client:
-                    with client.stream("POST", f"{OPENROUTER_BASE}/chat/completions",
-                                       headers=self._headers(), json=payload) as response:
-                        for line in response.iter_lines():
-                            if line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                if data_str == "[DONE]":
-                                    return
-                                try:
-                                    data = json.loads(data_str)
-                                except json.JSONDecodeError:
-                                    continue
-                                if data.get("choices"):
-                                    delta = data["choices"][0].get("delta", {}).get("content", "")
-                                    if delta:
-                                        yield delta
-                return
-            except (httpx.HTTPStatusError, KeyError, IndexError) as e:
-                print(f"[OpenRouter] Vision model {model} failed: {e}, trying fallback...")
-                time.sleep(1)
-                continue
-        yield ""  # All models exhausted
-
-    def complete(self, messages: list[dict]) -> str:
-        """Non-streaming completion with model fallback + retry."""
-        if not _HAS_HTTPX:
-            return ""
-
-        for model in self.fallback_models:
-            self.model = model
-            payload = self._payload(messages, stream=False)
-            try:
-                with httpx.Client(timeout=30) as client:
-                    resp = client.post(f"{OPENROUTER_BASE}/chat/completions",
-                                       headers=self._headers(), json=payload)
-                    data = resp.json()
-                    if "error" in data:
-                        err = data["error"]["message"][:80]
-                        print(f"[OpenRouter] {model}: {err}, trying fallback...")
-                        time.sleep(1)
-                        continue
-                    return data["choices"][0]["message"]["content"].strip()
-            except Exception as e:
-                print(f"[OpenRouter] {model} failed: {e}, trying fallback...")
-                time.sleep(1)
-                continue
-
-        return ""  # All models exhausted
 
 
 import cv2
 
 
 class VisionAgent:
-    """Multi-tier AI: OpenRouter (Claude/Llama/Gemma) -> Ollama -> rule-based."""
-
     def __init__(self):
-        self.openrouter = OpenRouterClient()
         self.memory: dict[str, PersonMemory] = {}
+        # Select backend: Bedrock if AWS configured, OpenRouter if API key set,
+        # otherwise local fallback
+        self.llm, self.llm_name = self._select_backend()
+        print(f"[Agent] LLM backend: {self.llm_name}")
+
+    def _select_backend(self):
+        """Pick the best available LLM backend (no AWS needed for local testing)."""
+        if _HAS_BOTO3 and os.getenv("AWS_ACCESS_KEY_ID"):
+            bedrock = BedrockLLM()
+            if bedrock.available:
+                return bedrock, "bedrock"
+        if OpenRouterClient().available:
+            client = OpenRouterClient()
+            if client.available:
+                return client, f"openrouter/{client.model}"
+        return LocalFallbackLLM(), "local-fallback"
 
     def _memory_for(self, identity: str) -> PersonMemory:
         if identity not in self.memory:
@@ -292,10 +140,10 @@ class VisionAgent:
         action = "ask"
         full_response = ""
 
-        if self.openrouter.available and frame is not None and not face_data.get("authorized", False):
+        if self.llm.available and frame is not None and not face_data.get("authorized", False) and hasattr(self.llm, "stream_with_image"):
             # Vision description first (for unrecognized visitors)
             vision_desc = ""
-            for token in self.openrouter.stream_with_image(
+            for token in self.llm.stream_with_image(
                 "Describe what you see and respond conversationally.",
                 frame, messages[:2],
             ):
@@ -303,15 +151,15 @@ class VisionAgent:
                 yield token, action
             # Now stream conversation response using vision insight
             messages.append({"role": "user", "content": vision_desc})
-            for token in self.openrouter.stream(messages):
+            for token in self.llm.stream(messages):
                 full_response += token
                 yield token, action
                 if any(kw in token.lower() for kw in {"enroll", "enrolling"}):
                     action = "enroll"
                 elif any(kw in token.lower() for kw in {"alert", "security", "escalate"}):
                     action = "alert"
-        elif self.openrouter.available:
-            for token in self.openrouter.stream(messages):
+        elif self.llm.available:
+            for token in self.llm.stream(messages):
                 full_response += token
                 yield token, action
                 if any(kw in token.lower() for kw in {"enroll", "enrolling"}):
@@ -329,19 +177,26 @@ class VisionAgent:
 
     def think(self, identity: str, face_data: dict,
               user_input: str | None = None) -> tuple[str, str]:
-        """Non-streaming convenience: full response + action."""
-        if self.openrouter.available:
-            messages = self._build_context(identity, face_data,
-                                           self._memory_for(identity), user_input)
-            response = self.openrouter.complete(messages)
+        """Non-streaming convenience: full response + action.
+
+        Records the turn to person memory in BOTH backend paths — the old
+        LLM path never persisted anything, so recognized visitors were
+        forgotten between runs.
+        """
+        mem = self._memory_for(identity)
+        if user_input:
+            mem.add_interaction("user", user_input)
+
+        if self.llm.available:
+            messages = self._build_context(identity, face_data, mem, user_input)
+            response = self.llm.complete(messages)
             action = self._decide(identity, user_input, response)
         else:
-            mem = self._memory_for(identity)
-            if user_input:
-                mem.add_interaction("user", user_input)
             response = self._fallback(identity, user_input, mem)
-            mem.add_interaction("assistant", response)
             action = self._decide(identity, user_input, response)
+
+        mem.add_interaction("assistant", response)
+        mem.save()
         return response, action
 
     def _fallback(self, identity: str, user_input: str | None, mem: PersonMemory) -> str:

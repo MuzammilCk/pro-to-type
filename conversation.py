@@ -32,7 +32,11 @@ class ConversationManager:
         self._state_just_changed = False
 
     def start_for(self, identity: str, face_data: dict) -> str:
-        """Begin a new unknown-visitor conversation."""
+        """Begin a new unknown-visitor conversation.
+
+        Returns the greeting text — the caller owns voice playback (B1 fix:
+        speaking here AND in the caller made the greeting play twice).
+        """
         if identity != "unknown":
             self.state = "IDLE"
             return ""
@@ -53,7 +57,6 @@ class ConversationManager:
             response, action = self.agent.think(identity, face_data)
 
         self._trigger_vision_event("capture_face", face_data)
-        self.voice.speak(response)
         return response
 
     def handle_response(self, user_input: str, identity: str, face_data: dict) -> tuple[str, str]:
@@ -76,7 +79,6 @@ class ConversationManager:
         else:
             response, action = self.agent.think(identity, face_data, user_input)
 
-        self.voice.speak(response)
         self.turn_count += 1
 
         # State transitions
