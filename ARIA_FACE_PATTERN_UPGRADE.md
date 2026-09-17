@@ -1,14 +1,22 @@
 # ARIA — Face Structure Pattern Upgrade (Recognition HUD)
 
-> **Behavior note (2026-09, confirmed by owner — FINAL).** The mesh renders
-> on UNRECOGNIZED faces ONLY. It is the "scanning an unknown face"
-> indicator: it appears the moment a face shows up and disappears the moment
-> the system recognizes the person or enrolls them. RECOGNIZED faces get NO
-> rectangle and NO mesh — only a small name caption. The earlier "green box
-> + name" look was explicitly rejected by the owner (it read as clutter).
-> Do NOT reintroduce boxes for authorized faces, do NOT "fix" the
-> disappearing mesh as a bug, and note the tracker absorbs ghost tracks to
-> prevent the same face ever rendering two patterns at once.
+> **Behavior note (2026-09, confirmed by owner — FINAL).** The "scanning"
+> indicator renders on UNRECOGNIZED faces ONLY. It appears the moment a face
+> shows up and disappears the moment the system recognizes the person or
+> enrolls them. RECOGNIZED faces get NO box and NO mesh — only a small name
+> caption. The earlier "green box + name" look was explicitly rejected by
+> the owner (it read as clutter). Do NOT reintroduce boxes for authorized
+> faces, do NOT "fix" the disappearing indicator as a bug, and note the
+> tracker absorbs ghost tracks to prevent the same face ever rendering two
+> patterns at once.
+>
+> **Renderer change (2026-09, web UI).** The indicator is no longer a
+> MediaPipe mesh painted by cv2 — it is now animated cyan corner brackets
+> drawn by the browser (webui.py, `.facebox.stranger`), positioned from
+> normalized track boxes in `/state`. face_pattern.py is retired from the
+> live path (kept in repo/history). Same contract, better renderer: real
+> typography, zero CPU cost in the vision loop. The vision pipeline no
+> longer draws anything onto frames — frames go to the browser untouched.
 
 Read this alongside `ARIA_ARCHITECTURE.md`, but treat this file as self-contained — the repo has moved on since that file was written, so don't assume the exact file layout it describes still holds.
 

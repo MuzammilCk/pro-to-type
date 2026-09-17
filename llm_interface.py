@@ -44,10 +44,14 @@ class OpenRouterClient(LLMClient):
 
     def _build_fallback_list(self) -> list[str]:
         primary = self.model
+        # Chain picked from a live latency benchmark of OpenRouter's free
+        # catalog (2026-09-17, bench_models.py): all three ~1.3-1.7s TTFT with
+        # clean spoken-style replies. The previous liquid/gemma entries were
+        # caught returning HTTP 429 (provider-saturated) during the bench.
         defaults = [
             "nex-agi/nex-n2.5-pro:free",
-            "liquid/lfm-2.5-2.6b:free",
-            "google/gemma-4-26b-a4b-it:free",
+            "inclusionai/ling-3.0-flash-sante:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
         ]
         return [primary] + [m for m in defaults if m != primary]
 
@@ -91,6 +95,11 @@ class OpenRouterClient(LLMClient):
                 with httpx.Client(timeout=30) as client:
                     with client.stream("POST", f"{self.BASE_URL}/chat/completions",
                                        headers=self._headers(), json=payload) as resp:
+                        # 429/5xx is routine on free tiers — fail over to the
+                        # next model instead of silently yielding nothing
+                        # (old bug: rate-limited model => ARIA went mute and
+                        # the fallback list was never tried).
+                        resp.raise_for_status()
                         for line in resp.iter_lines():
                             if line.startswith("data: "):
                                 data_str = line[6:].strip()
@@ -107,7 +116,7 @@ class OpenRouterClient(LLMClient):
                 return
             except Exception as e:
                 print(f"[OpenRouter] {model} failed: {e}, trying fallback...")
-                time.sleep(1)
+                time.sleep(0.2)  # next model, not a retry — keep voice snappy
 
     def complete(self, messages: list[dict]) -> str:
         if not self.available:
@@ -131,57 +140,10 @@ class OpenRouterClient(LLMClient):
                 time.sleep(1)
         return ""
 
-    def stream_with_image(self, text: str, frame, messages: list[dict] | None = None) -> Iterator[str]:
-        """Vision + streaming: send frame as base64 image."""
-        if not self.available:
-            return
-        import cv2, base64, httpx
-        success, encoded = cv2.imencode(".jpg", frame)
-        if not success:
-            return
-        b64 = base64.b64encode(encoded.tobytes()).decode("utf-8")
-        is_free = ":free" in self.model
-        msgs = messages or []
-        payload = {
-            "model": self.model,
-            "messages": msgs + [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                ],
-            }],
-            "stream": True,
-            "max_tokens": 300,
-            "temperature": 0.5,
-        }
-        if not is_free:
-            payload["provider"] = {"sort": "latency", "allow_fallbacks": True}
-
-        for model in self.fallback_models:
-            self.model = model
-            payload["model"] = model
-            try:
-                with httpx.Client(timeout=30) as client:
-                    with client.stream("POST", f"{self.BASE_URL}/chat/completions",
-                                       headers=self._headers(), json=payload) as resp:
-                        for line in resp.iter_lines():
-                            if line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                if data_str == "[DONE]":
-                                    return
-                                try:
-                                    data = json.loads(data_str)
-                                except json.JSONDecodeError:
-                                    continue
-                                if data.get("choices"):
-                                    delta = data["choices"][0].get("delta", {}).get("content", "")
-                                    if delta:
-                                        yield delta
-                return
-            except Exception as e:
-                print(f"[OpenRouter] Vision {model} failed: {e}, trying fallback...")
-                time.sleep(1)
+# NOTE (owner-confirmed architecture): the LLM client intentionally has NO
+# image/video input path. OpenCV is the only eyes of the system; the LLM is
+# a pure reasoner that reads OpenCV's text reports (see agent.py
+# VisionContext). Do not add frame-upload methods back.
 
 
 class LocalFallbackLLM(LLMClient):

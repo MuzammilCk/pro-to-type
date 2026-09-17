@@ -24,8 +24,8 @@ from llm_interface import OpenRouterClient, LocalFallbackLLM, BedrockLLM, _HAS_B
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_MODELS = [
     "nex-agi/nex-n2.5-pro:free",
-    "liquid/lfm-2.5-2.6b:free",
-    "google/gemma-4-26b-a4b-it:free",
+    "inclusionai/ling-3.0-flash-sante:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ]
 FALLBACK_MODEL = "nex-agi/nex-n2.5-pro:free"
 
@@ -140,25 +140,11 @@ class VisionAgent:
         action = "ask"
         full_response = ""
 
-        if self.llm.available and frame is not None and not face_data.get("authorized", False) and hasattr(self.llm, "stream_with_image"):
-            # Vision description first (for unrecognized visitors)
-            vision_desc = ""
-            for token in self.llm.stream_with_image(
-                "Describe what you see and respond conversationally.",
-                frame, messages[:2],
-            ):
-                vision_desc += token
-                yield token, action
-            # Now stream conversation response using vision insight
-            messages.append({"role": "user", "content": vision_desc})
-            for token in self.llm.stream(messages):
-                full_response += token
-                yield token, action
-                if any(kw in token.lower() for kw in {"enroll", "enrolling"}):
-                    action = "enroll"
-                elif any(kw in token.lower() for kw in {"alert", "security", "escalate"}):
-                    action = "alert"
-        elif self.llm.available:
+        # Architecture doctrine (owner-confirmed): OpenCV is the ONLY eyes.
+        # The LLM never receives camera frames — only OpenCV's text facts
+        # (already in messages via _build_context). The old stream_with_image
+        # path that uploaded the frame as base64 for strangers is removed.
+        if self.llm.available:
             for token in self.llm.stream(messages):
                 full_response += token
                 yield token, action
@@ -302,13 +288,23 @@ class VisionContext:
         self.summary = "No vision input right now."
         self.recent_events: list[str] = []
         self.last_known_name: str | None = None
+        self.objects: list[str] = []  # non-person object labels seen by OpenCV
 
     def update(self, face_results, detections=None):
         known = [fr.get("identity") for fr in face_results
                  if fr.get("authorized") and fr.get("identity") not in (None, "", "unknown")]
         strangers = sum(1 for fr in face_results if not fr.get("authorized"))
-        people = sum(1 for d in (detections or []) if getattr(d, "label", "") == "person")
+        dets = list(detections or [])
+        people = sum(1 for d in dets if getattr(d, "label", "") == "person")
+        # Object awareness crosses the eyes->brain bridge as TEXT labels
+        # (OpenCV's job is seeing; the LLM only ever reads its reports).
+        objects = []
+        for d in dets:
+            label = getattr(d, "label", "")
+            if label and label != "person" and label not in objects:
+                objects.append(label)
         with self.lock:
+            self.objects = objects[:5]
             if known:
                 self.last_known_name = known[0]
             if not face_results and not people:
@@ -332,7 +328,8 @@ class VisionContext:
     def context_text(self) -> str:
         with self.lock:
             ev = (" Recent: " + " | ".join(self.recent_events[-3:])) if self.recent_events else ""
-            return self.summary + ev
+            obj = (" Nearby objects: " + ", ".join(self.objects) + ".") if self.objects else ""
+            return self.summary + obj + ev
 
 
 class VoiceBrain:
@@ -352,6 +349,33 @@ class VoiceBrain:
     def __init__(self, agent: "VisionAgent"):
         self.agent = agent
         self.delegated = False
+        # Dedicated FAST client for spoken turns (GPT-Live: the live model is
+        # a different, smaller model than the backend brain). Small-talk only
+        # needs 1-2 short sentences — a 2-3B model answers with far lower
+        # first-token latency than the big backend model. OPT-IN: set
+        # ARIA_VOICE_MODEL in .env to enable; otherwise the shared backend
+        # LLM is used (keeps tests hermetic and behavior predictable).
+        self._fast_llm = None
+        # Benchmark-informed default (2026-09-17 bench_models.py): 1.4s TTFT,
+        # clean 1-2 sentence spoken replies. Override with ARIA_VOICE_MODEL.
+        fast_model = os.getenv("ARIA_VOICE_MODEL") or "inclusionai/ling-3.0-flash-sante:free"
+        try:
+            from llm_interface import OpenRouterClient
+            # Hermeticity guard: only attach a dedicated fast client when the
+            # backend brain itself is the real OpenRouter client (production).
+            # With test stubs or the offline LocalFallbackLLM, the voice brain
+            # just uses agent.llm — same channel as the backend.
+            backend_is_openrouter = isinstance(
+                getattr(self.agent, "llm", None), OpenRouterClient)
+            if backend_is_openrouter and OpenRouterClient().available:
+                client = OpenRouterClient()
+                client.model = fast_model
+                client.fallback_models = [fast_model] + [
+                    m for m in client.fallback_models if m != fast_model]
+                self._fast_llm = client
+                print(f"[VoiceBrain] fast spoken-turn model: {fast_model}")
+        except Exception as e:  # noqa: BLE001 — voice brain must never crash init
+            print(f"[VoiceBrain] fast model unavailable ({e}); using backend LLM")
 
     @property
     def available(self) -> bool:
@@ -368,8 +392,9 @@ class VoiceBrain:
         """Yield spoken-turn tokens; sets self.delegated on a [DELEGATE] verdict."""
         self.delegated = False
         prompt = user_text or "(The person just arrived and is looking at you — greet them warmly in one sentence.)"
-        if self.agent.llm.available:
-            tokens = self.agent.llm.stream(self._messages(context, history, prompt))
+        llm = self._fast_llm if self._fast_llm is not None else self.agent.llm
+        if llm.available:
+            tokens = llm.stream(self._messages(context, history, prompt))
         else:
             tokens = iter([self.agent._fallback("unknown", prompt,
                                                 self.agent._memory_for("unknown"))])

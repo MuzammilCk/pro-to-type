@@ -26,30 +26,26 @@ if os.path.exists(_env_path):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-import cv2
 import numpy as np
 
 from detector import Detector
 from reasoner import Reasoner
 from alerter import Alerter
 from face_engine import FaceEngine
-from face_pattern import FacePatternEngine
 from tracker import FaceTracker
 from presence import PresenceManager
-from input_source import InputManager, WebcamSource, IPCameraSource, FileSource
+from input_source import WebcamSource
 from conversation import ConversationManager
 from agent import VisionAgent, VisionContext, VoiceSession
 from voice import SarvamVoice
 from mic_vad import MicVAD
 from companion import ProactiveEngine
 from context_memory import PersonMemory, SessionManager
+from webui import UiHub, serve, render_jpeg
 
 
 CONFIG = {
     "model_path": os.getenv("MODEL_PATH", "models/yolov5s.onnx"),
-    "phone_url": os.getenv("PHONE_CAM_URL", ""),
-    "ipcam_url": os.getenv("IP_CAM_URL", ""),
-    "file_source": os.getenv("VIDEO_SOURCE", "samples/face_test.jpg"),
 }
 
 # Words that mean "no" — anything else is treated as consent to enroll
@@ -94,13 +90,12 @@ class VisionAgentApp:
             self.memory.update(saved)
             print(f"[Session] Resumed {len(saved)} person memory(s)")
 
-        # Input management
-        self.manager = InputManager()
-        self.manager.register("webcam", WebcamSource(0))
-        self.manager.register("phone", IPCameraSource(CONFIG["phone_url"], "Phone Camera"))
-        self.manager.register("file", FileSource(CONFIG["file_source"]))
-        if CONFIG["ipcam_url"]:
-            self.manager.register("ipcam", IPCameraSource(CONFIG["ipcam_url"], "IP Camera"))
+        # Input: webcam only (owner decision — IPCam/Phone/File inputs removed;
+        # dev phase has exactly one camera and one person on it).
+        self.source = WebcamSource(0)
+
+        # Web dashboard (replaces the cv2.imshow debug window)
+        self.hub = UiHub()
 
         # Latest frame + analysis (shared between vision thread and render thread)
         self._frame_lock = threading.Lock()
@@ -112,43 +107,37 @@ class VisionAgentApp:
         self.tracker = FaceTracker(self.face_engine)
         self.presence = PresenceManager(self.vision_events)
 
-        # Landmark pattern renderer (ARIA_FACE_PATTERN_UPGRADE.md): visual-only
-        # component that draws a MediaPipe landmark mesh on UNRECOGNIZED faces.
-        # It reads the tracker's existing authorized status — no new state.
-        self.pattern_engine = FacePatternEngine()
-        self._frame_idx = 0
-        self._yolo_idx = 0
+        # Face-state overlay moved from cv2 pixels to DOM (web UI): the
+        # stranger-scan indicator is now drawn by the browser. This also
+        # removes the MediaPipe mesh render from the hot loop — the same
+        # CPU reasoning as the YOLO throttle: conversation > visualization.
+        # Companion-phase CPU budget (owner decision, dev phase: owner is the
+        # only person on camera): YOLO is visualization/awareness only, so it
+        # runs on a slow TIME-based cadence instead of every frame. At 640x640
+        # it was ~150-250ms/frame — the single biggest CPU cost (3.9 FPS), and
+        # that starvation delayed the VAD mic and speech threads. Set
+        # ARIA_YOLO_EVERY_SEC=0 to disable YOLO entirely.
+        self._yolo_every = float(os.getenv("ARIA_YOLO_EVERY_SEC", "2.0"))
+        self._last_yolo = 0.0
         self._last_detections = None
 
     def run(self):
-        cv2.namedWindow("ARIA — Full-Duplex Vision Agent")
-        cv2.setMouseCallback("ARIA — Full-Duplex Vision Agent",
-                             self.manager.handle_mouse, {"frame_w": 640})
-        self.manager.switch_to("webcam")
+        httpd, _ui_t = serve(self.hub)
+        port = httpd.server_address[1]
+        print(f"ARIA UI:  http://127.0.0.1:{port}   (Ctrl+C in this terminal to quit)")
 
         vision_t = threading.Thread(target=self._vision_loop, daemon=True)
         voice_t = threading.Thread(target=self._conversation_loop, daemon=True)
         vision_t.start()
         voice_t.start()
 
-        print("ARIA ready. Keys: 1=Webcam 2=Phone 3=File 4=IPCAM. Q=Quit")
-
-        while not self._stop.is_set():
-            with self._frame_lock:
-                frame = self._latest_frame.copy() if self._latest_frame is not None else None
-                decision = self._latest_decision
-
-            if frame is None:
-                if cv2.waitKey(500) & 0xFF == ord("q"):
-                    self._stop.set()
-                continue
-
-            self._render(frame, decision)
-
-            key = cv2.waitKey(1) & 0xFF
-            self._handle_key(key)
-            if key == ord("q"):
-                self._stop.set()
+        try:
+            while not self._stop.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._stop.set()
 
         vision_t.join(timeout=2)
         voice_t.join(timeout=2)
@@ -156,7 +145,8 @@ class VisionAgentApp:
             self.mic.stop()
         if self.proactive is not None:
             self.proactive.stop()
-        cv2.destroyAllWindows()
+        self.source.close()
+        httpd.shutdown()
 
     def _vision_loop(self):
         """Continuously captures + analyzes frames using tracker + presence manager.
@@ -169,23 +159,22 @@ class VisionAgentApp:
         """
         fps_buf = []
         while not self._stop.is_set():
-            ret, frame = self.manager.read()
+            ret, frame = self.source.read()
             if not ret or frame is None:
                 time.sleep(0.5)
                 continue
 
             t0 = time.perf_counter()
 
-            # YOLO object detection — throttled to every 3rd frame. It is
-            # visualization/awareness only, and at 640x640 it was the single
-            # biggest CPU cost (3.9 FPS total). Face detection/recognition
-            # still runs every frame.
-            if self._yolo_idx % 3 == 0 or self._last_detections is None:
+            # YOLO object detection — time-throttled (companion-phase budget).
+            # Face detection/recognition still runs EVERY frame; YOLO boxes
+            # are just HUD/awareness and refresh every _yolo_every seconds.
+            if self._yolo_every > 0 and (t0 - self._last_yolo) >= self._yolo_every:
                 detections = self.detector.detect(frame)
                 self._last_detections = detections
+                self._last_yolo = t0
             else:
                 detections = self._last_detections
-            self._yolo_idx += 1
 
             # Face tracking (with frame-skipping + downscale)
             face_results = self.tracker.update(frame, downscale_factor=0.5)
@@ -205,34 +194,48 @@ class VisionAgentApp:
             # Clean up lost faces
             self.tracker.cleanup_left_faces()
 
-            # Landmark pattern (visual-only): analyze every frame (internally
-            # throttled per track), render on unrecognized faces only. When a
-            # face becomes recognized the pattern stops drawing immediately.
-            unrecognized = [fr for fr in face_results if not fr["authorized"]]
-            self.pattern_engine.analyze(frame, unrecognized, self._frame_idx)
-            for fr in unrecognized:
-                self.pattern_engine.draw(frame, fr["track_id"])
-            self.pattern_engine.prune({fr["track_id"] for fr in face_results})
-            self._frame_idx += 1
-
-            # Render
-            for d in detections:
-                self.detector.draw(frame, d)
+            # UI state: normalized face boxes (browser draws the overlays)
+            ih, iw = frame.shape[:2]
+            faces_ui = []
+            known_names = []
+            strangers = 0
             for fr in face_results:
-                self._draw_face(frame, fr)
+                x, y, w, h = fr["face_bbox"]
+                is_known = bool(fr["authorized"])
+                if is_known:
+                    known_names.append(fr.get("identity") or "known")
+                else:
+                    strangers += 1
+                faces_ui.append({
+                    "kind": "known" if is_known else "stranger",
+                    "name": fr.get("identity") or "",
+                    "x": x / iw, "y": y / ih, "w": w / iw, "h": h / ih,
+                })
+            self.hub.set_faces(faces_ui)
+            self.hub.set_people(
+                [{"kind": "known", "name": n} for n in known_names]
+                + ([{"kind": "scan", "count": strangers}] if strangers else []))
+            jpeg = render_jpeg(frame)
+            if jpeg is not None:
+                self.hub.update_frame(jpeg)
 
             fps_buf.append(time.perf_counter() - t0)
             if len(fps_buf) > 30:
                 fps_buf.pop(0)
             avg_dt = sum(fps_buf) / len(fps_buf) if fps_buf else 0.1
-            self._status_text = f"{1/avg_dt:.1f} FPS | faces={len(face_results)} | tracks={self.tracker.track_count}"
+            yolo_state = ("off" if self._yolo_every <= 0
+                          else f"{self._yolo_every:.0f}s")
+            self._status_text = (f"{1/avg_dt:.1f} FPS | faces={len(face_results)} | "
+                                 f"tracks={self.tracker.track_count} | yolo={yolo_state}")
+            self.hub.set_status({"fps": 1 / avg_dt if avg_dt else 0.0,
+                                 "yolo": yolo_state})
 
             with self._frame_lock:
                 self._latest_frame = frame
                 self._latest_decision = {
                     "face_results": face_results,
                     "should_act": any(not fr["authorized"] for fr in face_results),
-                    "total": len(detections),
+                    "total": len(detections or []),
                 }
 
             # Periodic frame summary (every 3s)
@@ -384,8 +387,14 @@ class VisionAgentApp:
         self.mic = MicVAD()
         # Echo guard (pseudo-duplex): while ARIA speaks, the VAD suppresses
         # input so she never transcribes her own voice from the speakers.
-        self.voice.set_speaking_callback(
-            lambda speaking: setattr(self.mic, "speaking", speaking))
+        # The same signal drives the UI orb (speaking <-> listening).
+        def _echo_guard(speaking: bool):
+            self.mic.speaking = speaking
+            self.hub.set_aria_state("speaking" if speaking else "listening")
+
+        self.voice.set_speaking_callback(_echo_guard)
+        # Web UI transcript: every spoken line and heard turn lands in the rail
+        self.voice.set_ui_hooks(on_say=self.hub.say, on_heard=self.hub.heard)
         self.vision_ctx = VisionContext()
         self.session = VoiceSession(self.agent, self.voice, mic=self.mic,
                                     vision=self.vision_ctx)
@@ -476,6 +485,7 @@ class VisionAgentApp:
         idle_turns = 0
         while conv.state != "IDLE" and not self._stop.is_set():
             timeout = 12.0 if self.mic is not None else 12.0
+            self.hub.set_aria_state("listening")
             transcript = self.voice.listen(timeout=timeout, phrase_limit=8,
                                            mic=self.mic)
             if not transcript:
@@ -493,6 +503,7 @@ class VisionAgentApp:
             idle_turns = 0
             if self.session is not None:
                 self.session.touch_activity()
+            self.hub.set_aria_state("thinking")
 
             response, action = conv.handle_response(transcript, conv.current_identity, face_data)
 
@@ -540,35 +551,7 @@ class VisionAgentApp:
 
     # ------------------------------------------------------------------
 
-    def _draw_face(self, frame, fr):
-        x, y, w, h = fr["face_bbox"]
-        # Final UX spec (owner-confirmed): the landmark mesh is ONLY the
-        # "scanning an unknown face" indicator — it appears the moment a face
-        # shows up and disappears as soon as the person is recognized or
-        # enrolled. Authorized faces get NO box and NO mesh — just a small
-        # name caption so you can see recognition is working.
-        if fr["authorized"]:
-            label = f"{fr['identity']} ({fr['distance']:.2f})"
-            cv2.putText(frame, label, (x, y + h + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 230, 140), 1)
-        else:
-            # Unrecognized: the mesh (drawn above by pattern_engine) marks the
-            # face; the red caption explains the state.
-            cv2.putText(frame, "UNRECOGNIZED — SCAN ACTIVE", (x, y + h + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
-    def _render(self, frame, decision):
-        frame_disp = frame.copy()
-        if self._status_text:
-            cv2.putText(frame_disp, self._status_text, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-        frame_disp = self.manager.draw_controls(frame_disp)
-        cv2.imshow("ARIA — Full-Duplex Vision Agent", frame_disp)
-
-    def _handle_key(self, key):
-        key_map = {"1": "webcam", "2": "phone", "3": "file", "4": "ipcam"}
-        if chr(key) in key_map and chr(key) in self.manager._sources:
-            self.manager.switch_to(chr(key))
 
 
 if __name__ == "__main__":

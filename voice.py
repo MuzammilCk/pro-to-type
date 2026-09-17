@@ -68,6 +68,10 @@ class SarvamVoice:
         # Echo guard hook: called with True/False while TTS audio plays so
         # MicVAD can suppress ARIA's own voice (pseudo-duplex).
         self._on_speaking = None
+        # UI hooks (web dashboard): on_say fires for every spoken utterance,
+        # on_heard for every transcribed user turn.
+        self._on_say = None
+        self._on_heard = None
         # Set while the SpeechQueue worker is actively playing an utterance
         self._speech_busy = threading.Event()
 
@@ -87,18 +91,25 @@ class SarvamVoice:
         interrupted first, then a fixed capture window is recorded.
         """
         if mic is not None:
-            return self._listen_vad(mic, timeout, phrase_limit)
-        self.interrupt()  # Barge-in: bump generation so in-flight TTS aborts
-        if self._tts_thread is not None and self._tts_thread.is_alive():
-            self._tts_thread.join(timeout=0.5)
-        self._interrupt_flag.clear()
-        self._tts_thread = None
-        if self.available():
-            return self._listen_sarvam(timeout, phrase_limit)
-        elif _HAS_STT_LOCAL:
-            return self._listen_local()
+            result = self._listen_vad(mic, timeout, phrase_limit)
         else:
-            return self._listen_keyboard()
+            self.interrupt()  # Barge-in: bump generation so in-flight TTS aborts
+            if self._tts_thread is not None and self._tts_thread.is_alive():
+                self._tts_thread.join(timeout=0.5)
+            self._interrupt_flag.clear()
+            self._tts_thread = None
+            if self.available():
+                result = self._listen_sarvam(timeout, phrase_limit)
+            elif _HAS_STT_LOCAL:
+                result = self._listen_local()
+            else:
+                result = self._listen_keyboard()
+        if result and self._on_heard is not None:
+            try:
+                self._on_heard(result)
+            except Exception:
+                pass
+        return result
 
     def _listen_sarvam(self, timeout: float, phrase_limit: float) -> str:
         """WebSocket streaming STT with Saaras."""
@@ -261,11 +272,27 @@ class SarvamVoice:
         """
         self._on_speaking = cb
 
+    def set_ui_hooks(self, on_say=None, on_heard=None):
+        """Register transcript hooks for the web UI.
+
+        on_say(text) fires for every utterance ARIA speaks; on_heard(text)
+        for every user turn that survives transcription.
+        """
+        if on_say is not None:
+            self._on_say = on_say
+        if on_heard is not None:
+            self._on_heard = on_heard
+
     def speak(self, text: str, interrupt: bool = True):
         """Block until speech completes. Interrupt any older utterance first."""
         cb = self._on_speaking
         if cb:
             cb(True)
+        if self._on_say is not None and text and text.strip():
+            try:
+                self._on_say(text)
+            except Exception:
+                pass
         try:
             if interrupt:
                 self.interrupt()
