@@ -38,8 +38,10 @@ from tracker import FaceTracker
 from presence import PresenceManager
 from input_source import InputManager, WebcamSource, IPCameraSource, FileSource
 from conversation import ConversationManager
-from agent import VisionAgent
+from agent import VisionAgent, VisionContext, VoiceSession
 from voice import SarvamVoice
+from mic_vad import MicVAD
+from companion import ProactiveEngine
 from context_memory import PersonMemory, SessionManager
 
 
@@ -73,6 +75,13 @@ class VisionAgentApp:
         self.agent = VisionAgent()
         self.voice = SarvamVoice()
         self.memory: dict[str, PersonMemory] = {}
+
+        # Talkative upgrade (GPT-Live-style): voice session pieces. Created
+        # here, started in the conversation thread.
+        self.mic: MicVAD | None = None
+        self.vision_ctx: VisionContext | None = None
+        self.session: VoiceSession | None = None
+        self.proactive: ProactiveEngine | None = None
 
         # Thread-safe event queues
         self.vision_events: queue.Queue = queue.Queue()
@@ -108,6 +117,8 @@ class VisionAgentApp:
         # It reads the tracker's existing authorized status — no new state.
         self.pattern_engine = FacePatternEngine()
         self._frame_idx = 0
+        self._yolo_idx = 0
+        self._last_detections = None
 
     def run(self):
         cv2.namedWindow("ARIA — Full-Duplex Vision Agent")
@@ -141,6 +152,10 @@ class VisionAgentApp:
 
         vision_t.join(timeout=2)
         voice_t.join(timeout=2)
+        if self.mic is not None:
+            self.mic.stop()
+        if self.proactive is not None:
+            self.proactive.stop()
         cv2.destroyAllWindows()
 
     def _vision_loop(self):
@@ -161,11 +176,23 @@ class VisionAgentApp:
 
             t0 = time.perf_counter()
 
-            # YOLO object detection (people, objects) — for visualization
-            detections = self.detector.detect(frame)
+            # YOLO object detection — throttled to every 3rd frame. It is
+            # visualization/awareness only, and at 640x640 it was the single
+            # biggest CPU cost (3.9 FPS total). Face detection/recognition
+            # still runs every frame.
+            if self._yolo_idx % 3 == 0 or self._last_detections is None:
+                detections = self.detector.detect(frame)
+                self._last_detections = detections
+            else:
+                detections = self._last_detections
+            self._yolo_idx += 1
 
             # Face tracking (with frame-skipping + downscale)
             face_results = self.tracker.update(frame, downscale_factor=0.5)
+
+            # Feed "what ARIA sees" to the conversational brain (Phase 3)
+            if self.vision_ctx is not None:
+                self.vision_ctx.update(face_results, detections)
 
             # Run recognition only on faces that need it (new or stale tracks)
             if any(fr.get("needs_recognition") for fr in face_results):
@@ -352,6 +379,20 @@ class VisionAgentApp:
             frame_provider=self._latest_frame_now,
         )
 
+        # Voice session stack (talkative upgrade): VAD mic, split-brain
+        # session, vision context, proactive companion.
+        self.mic = MicVAD()
+        # Echo guard (pseudo-duplex): while ARIA speaks, the VAD suppresses
+        # input so she never transcribes her own voice from the speakers.
+        self.voice.set_speaking_callback(
+            lambda speaking: setattr(self.mic, "speaking", speaking))
+        self.vision_ctx = VisionContext()
+        self.session = VoiceSession(self.agent, self.voice, mic=self.mic,
+                                    vision=self.vision_ctx)
+        self.proactive = ProactiveEngine(self.agent, self.voice, self.vision_ctx,
+                                         session=self.session)
+        self.proactive.start()
+
         while not self._stop.is_set():
             try:
                 event = self.vision_events.get(timeout=0.5)
@@ -372,6 +413,11 @@ class VisionAgentApp:
                 }
                 self.presence.mark_greeted(track_id)
 
+                # Phase 3: let the conversational brain know who showed up
+                if self.vision_ctx is not None and name not in ("", "friend", "unknown"):
+                    self.vision_ctx.last_known_name = name
+                    self.vision_ctx.add_event(f"{name} arrived and was recognized.")
+
                 response, action = self.agent.think(name, face_data)
                 self._speak(response)
                 self._dialogue_loop(conv, name, face_data)
@@ -386,12 +432,17 @@ class VisionAgentApp:
                 }
                 self.presence.mark_greeted(event.get("track_id", ""))
 
+                if self.vision_ctx is not None:
+                    self.vision_ctx.add_event("A new visitor arrived and is being scanned.")
+
                 greeting = conv.start_for("unknown", face_data)
                 self._speak(greeting)
                 self._dialogue_loop(conv, "unknown", face_data)
 
             elif evt_type == "person_left":
                 conv.reset()
+                if self.mic is not None:
+                    self.mic.clear_pending()
                 self.voice.speak_async("Goodbye! Come back soon.")
 
             elif evt_type == "frame_summary":
@@ -406,18 +457,42 @@ class VisionAgentApp:
 
         B5 fix: recognized visitors previously never reached a listen() call,
         so anything they said after the greeting fell into the void.
+
+        Talkative upgrade (GPT-Live-style):
+        - VAD mic: capture starts at speech onset, ends at natural pause —
+          no fixed 8s windows.
+        - CRITICAL MUTE FIX: dialogue replies are now actually SPOKEN. The
+          old loop called conv.handle_response() and discarded the text —
+          ARIA went silent after the greeting.
+        - Normal chat turns go through the split-brain VoiceSession (short
+          spoken answers, delegation to the backend brain for depth).
+        - Session stays open through idle gaps; a gentle nudge after ~90s.
         """
         if conv.current_identity is None:
             conv.current_identity = identity
+        if self.session is not None:
+            self.session.touch_activity()
 
+        idle_turns = 0
         while conv.state != "IDLE" and not self._stop.is_set():
-            transcript = self.voice.listen(timeout=12, phrase_limit=8)
+            timeout = 12.0 if self.mic is not None else 12.0
+            transcript = self.voice.listen(timeout=timeout, phrase_limit=8,
+                                           mic=self.mic)
             if not transcript:
-                # No reply — end politely instead of hanging in the state machine
-                if conv.state != "ENROLLING":
+                idle_turns += 1
+                if conv.state == "ENROLLING":
+                    continue
+                # Long silence: one gentle nudge, then close politely
+                nudged = (self.session is not None
+                          and self.session.maybe_nudge(identity, face_data))
+                if not nudged and idle_turns >= 3:
                     conv.reset()
                     break
                 continue
+
+            idle_turns = 0
+            if self.session is not None:
+                self.session.touch_activity()
 
             response, action = conv.handle_response(transcript, conv.current_identity, face_data)
 
@@ -428,7 +503,8 @@ class VisionAgentApp:
                 name = self._extract_name(transcript)
                 if name is None:
                     self._speak("And what should I call you?")
-                    name_reply = self.voice.listen(timeout=8, phrase_limit=5)
+                    name_reply = self.voice.listen(timeout=8, phrase_limit=5,
+                                                   mic=self.mic)
                     name = self._extract_name(name_reply or "")
                 if name is None:
                     self._speak("No worries — we can skip that for now.")
@@ -445,23 +521,39 @@ class VisionAgentApp:
                 self.voice.speak_async("I'm escalating this to security.")
                 conv.reset()
                 break
-            # action == "ask": loop continues — listen for their next line
+            elif action == "escalate" or action == "recognized":
+                # State-machine verdicts (turn limit / recognized handshake):
+                # speak the composed response — never discard it again.
+                self._speak(response)
+                if action == "escalate":
+                    conv.reset()
+                    break
+            else:
+                # Normal chat: the split-brain session answers AND speaks
+                # (short spoken turn; deep questions are delegated to the
+                # backend brain with fillers while it works).
+                if self.session is not None:
+                    self.session.run_turn(identity, face_data, user_text=transcript)
+                else:
+                    self._speak(response)
+            # loop continues — listen for their next line
 
     # ------------------------------------------------------------------
 
     def _draw_face(self, frame, fr):
         x, y, w, h = fr["face_bbox"]
+        # Final UX spec (owner-confirmed): the landmark mesh is ONLY the
+        # "scanning an unknown face" indicator — it appears the moment a face
+        # shows up and disappears as soon as the person is recognized or
+        # enrolled. Authorized faces get NO box and NO mesh — just a small
+        # name caption so you can see recognition is working.
         if fr["authorized"]:
-            # Recognized: keep the classic green box + name label.
-            color = (0, 255, 0)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
             label = f"{fr['identity']} ({fr['distance']:.2f})"
             cv2.putText(frame, label, (x, y + h + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 230, 140), 1)
         else:
-            # Unrecognized: the MediaPipe landmark pattern IS the face marker
-            # (drawn just above by pattern_engine). No rectangle — the mesh
-            # follows the actual face boundary instead.
+            # Unrecognized: the mesh (drawn above by pattern_engine) marks the
+            # face; the red caption explains the state.
             cv2.putText(frame, "UNRECOGNIZED — SCAN ACTIVE", (x, y + h + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 

@@ -237,3 +237,339 @@ class VisionAgent:
         if any(k in r for k in {"alert", "security", "escalat", "leave"}):
             return "alert"
         return "ask"
+
+
+# ======================================================================
+# Talkative upgrade (Phases 2-3) — GPT-Live-style split-brain + vision
+#
+# OpenAI's GPT-Live doctrine applied here with client delegation:
+#   * a fast VOICE BRAIN owns speaking behavior (short spoken turns,
+#     warmth, pacing) and decides when a question needs depth;
+#   * the BACKEND BRAIN (VisionAgent's LLM + memory + tools) handles the
+#     substantive answer while ARIA keeps the floor with fillers;
+#   * what ARIA SEES is injected into every spoken turn.
+# ======================================================================
+
+VOICE_SYSTEM_PROMPT = """You are ARIA's speaking voice — a warm, curious AI companion people talk to out loud.
+
+SPEAKING RULES (critical — this is read aloud by TTS):
+- Reply in 1-2 short sentences. Never more unless directly asked for detail.
+- Plain conversational words only. No markdown, lists, emoji, or symbols.
+- Sound alive: react to what you see, use the person's name when you know it.
+- End with ONE light question at most, and not on every turn.
+
+DELEGATION:
+If the visitor needs real reasoning, current events, math, code, detailed
+facts, or step-by-step help, reply with EXACTLY:
+[DELEGATE]
+and nothing else. A deeper brain takes over and speaks afterwards.
+
+CONTEXT FOR THIS TURN:
+{context}
+"""
+
+_SENTENCE_ENDERS = (".", "!", "?")
+
+
+def _split_sentences(text: str) -> tuple[list[str], str]:
+    """Split streamed text into complete sentences + the unspoken remainder.
+
+    Decimal points ("3.14") and abbreviations followed by a letter survive
+    unsplit; a terminator followed by whitespace/end closes a sentence.
+    """
+    sentences, start = [], 0
+    for i, ch in enumerate(text):
+        if ch in _SENTENCE_ENDERS:
+            nxt = text[i + 1:i + 2]
+            if nxt in (" ", "", "\n", "\t"):
+                piece = text[start:i + 1].strip()
+                if piece:
+                    sentences.append(piece)
+                start = i + 1
+    return sentences, text[start:]
+
+
+class VisionContext:
+    """Compact "what ARIA sees" summary, refreshed each vision frame.
+
+    Injected into the voice brain's context so spoken replies naturally
+    reference the room ("I see you brought a friend...") — the fusion that
+    makes ARIA more than a voice assistant.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.summary = "No vision input right now."
+        self.recent_events: list[str] = []
+        self.last_known_name: str | None = None
+
+    def update(self, face_results, detections=None):
+        known = [fr.get("identity") for fr in face_results
+                 if fr.get("authorized") and fr.get("identity") not in (None, "", "unknown")]
+        strangers = sum(1 for fr in face_results if not fr.get("authorized"))
+        people = sum(1 for d in (detections or []) if getattr(d, "label", "") == "person")
+        with self.lock:
+            if known:
+                self.last_known_name = known[0]
+            if not face_results and not people:
+                self.summary = "No one is in view right now."
+            else:
+                parts = []
+                if known:
+                    parts.append("Recognized: " + ", ".join(known) + ".")
+                if strangers:
+                    parts.append(f"{strangers} unrecognized visitor(s) here.")
+                extra = people - len(face_results)
+                if extra > 0:
+                    parts.append(f"{extra} other person(s) in the background.")
+                self.summary = " ".join(parts)
+
+    def add_event(self, description: str):
+        with self.lock:
+            self.recent_events.append(description)
+            self.recent_events = self.recent_events[-5:]
+
+    def context_text(self) -> str:
+        with self.lock:
+            ev = (" Recent: " + " | ".join(self.recent_events[-3:])) if self.recent_events else ""
+            return self.summary + ev
+
+
+class VoiceBrain:
+    """The fast spoken-turn model (GPT-Live "speaking behavior" layer).
+
+    Streams a short conversational verdict; if the question needs the
+    backend brain, the stream ends with a [DELEGATE] token and the caller
+    hands off to VisionAgent's full pipeline.
+    """
+
+    _FILLERS = (
+        "Hmm, let me think about that.",
+        "One second...",
+        "Good question — give me a moment.",
+    )
+
+    def __init__(self, agent: "VisionAgent"):
+        self.agent = agent
+        self.delegated = False
+
+    @property
+    def available(self) -> bool:
+        return self.agent.llm.available
+
+    def _messages(self, context: str, history: list[dict], user_text: str) -> list[dict]:
+        msgs = [{"role": "system",
+                 "content": VOICE_SYSTEM_PROMPT.format(context=context or "No vision input right now.")}]
+        msgs.extend(history[-6:])
+        msgs.append({"role": "user", "content": user_text})
+        return msgs
+
+    def reply_stream(self, context: str, history: list[dict], user_text: str | None) -> Iterator[str]:
+        """Yield spoken-turn tokens; sets self.delegated on a [DELEGATE] verdict."""
+        self.delegated = False
+        prompt = user_text or "(The person just arrived and is looking at you — greet them warmly in one sentence.)"
+        if self.agent.llm.available:
+            tokens = self.agent.llm.stream(self._messages(context, history, prompt))
+        else:
+            tokens = iter([self.agent._fallback("unknown", prompt,
+                                                self.agent._memory_for("unknown"))])
+        buf = ""
+        for tok in tokens:
+            buf += tok
+            if not self.delegated and "[delegate" in buf.lower():
+                self.delegated = True
+                return
+            yield tok
+        if not self.delegated and not buf.strip():
+            self.delegated = True  # empty answer -> treat as "needs the backend"
+
+    def filler(self) -> str:
+        import random
+        return random.choice(self._FILLERS)
+
+
+class VoiceSession:
+    """Turn-taking engine: voice brain answers, delegates depth, speaks live.
+
+    run_turn() BLOCKS the conversation thread (voice I/O is serialized there)
+    but speech is enqueued sentence-by-sentence so playback runs while the
+    LLM keeps streaming — first audible words land ~one sentence after the
+    model starts, not after the whole answer completes.
+    """
+
+    NUDGE_MINUTES = 1.5   # idle minutes before a conversational nudge
+    MAX_NUDGES = 2        # max nudges before ARIA stops poking the human
+    CACHE_TTL = 60.0      # backend answers cached this long per question
+
+    def __init__(self, agent: "VisionAgent", voice, mic=None, vision: VisionContext | None = None):
+        self.agent = agent
+        self.voice = voice
+        self.mic = mic
+        self.vision = vision
+        self.brain = VoiceBrain(agent)
+        self.history: list[dict] = []
+        self.busy = False
+        self.pending_action = "ask"
+        self.last_activity = time.time()
+        self._nudges = 0
+        self._nudge_lock = threading.Lock()
+        self._backend_cache: dict[tuple, tuple[float, str]] = {}
+        self._stop_fillers = False
+
+    # ------------------------------------------------------------------
+
+    def touch_activity(self):
+        """Mark real interaction (resets the nudge budget)."""
+        self.last_activity = time.time()
+        self._nudges = 0
+
+    def run_turn(self, identity: str, face_data: dict,
+                 user_text: str | None = None, max_fillers: int = 2) -> str:
+        """Handle one conversational turn end-to-end (speaks; returns text)."""
+        if self.busy:
+            return ""
+        self.busy = True
+        self.pending_action = "ask"
+        try:
+            return self._run_turn(identity, face_data, user_text, max_fillers)
+        finally:
+            self.busy = False
+
+    def _run_turn(self, identity: str, face_data: dict,
+                  user_text: str | None, max_fillers: int) -> str:
+        mem = self.agent._memory_for(identity)
+        if user_text:
+            mem.add_interaction("user", user_text)
+
+        ctx = self.vision.context_text() if self.vision is not None else ""
+        history = list(self.history)
+
+        said_any = False
+        fillers_used = 0
+        self._stop_fillers = False
+
+        def maybe_filler():
+            nonlocal fillers_used
+            if self._stop_fillers or said_any or fillers_used >= max_fillers:
+                return
+            fillers_used += 1
+            self.voice.enqueue_speech(self.brain.filler())
+
+        timer = threading.Timer(1.2, maybe_filler)
+        timer.daemon = True
+        if user_text:
+            timer.start()
+
+        voice_full = ""   # complete voice-brain text
+        pending = ""      # not-yet-spoken remainder
+        try:
+            for tok in self.brain.reply_stream(ctx, history, user_text):
+                voice_full += tok
+                pending += tok
+                sentences, pending = _split_sentences(pending)
+                for s in sentences:
+                    said_any = True
+                    self.voice.enqueue_speech(s)
+            if not self.brain.delegated and pending.strip():
+                tail = pending.replace("[", "").replace("]", "").strip()
+                if tail:
+                    said_any = True
+                    self.voice.enqueue_speech(tail)
+        finally:
+            self._stop_fillers = True
+            timer.cancel()
+
+        if self.brain.delegated:
+            full = self._backend_deliver(identity, face_data, user_text, said_any)
+        else:
+            full = voice_full.replace("[", "").replace("]", "").strip()
+            self._record(identity, full)
+
+        self.history.append({"role": "user", "content": user_text or "(arrived)"})
+        self.history.append({"role": "assistant", "content": full or ""})
+        self.history = self.history[-12:]
+
+        low = full.lower()
+        if any(k in low for k in ("enroll", "look at the camera", "now authorized",
+                                  "register you", "save your face")):
+            self.pending_action = "enroll"
+        elif any(k in low for k in ("alert", "security", "escalat")):
+            self.pending_action = "alert"
+        return full
+
+    # ------------------------------------------------------------------
+
+    def _backend_stream(self, identity: str, face_data: dict, user_text: str | None):
+        for tok, _action in self.agent.stream_response(identity, face_data, user_text):
+            yield tok
+
+    def _backend_deliver(self, identity: str, face_data: dict,
+                         user_text: str | None, voice_said: bool) -> str:
+        key = (identity, (user_text or "").lower().strip())
+        now = time.time()
+        cached = self._backend_cache.get(key)
+        if cached is not None and now - cached[0] < self.CACHE_TTL:
+            for s in self._sentences_of(cached[1]):
+                self.voice.enqueue_speech(s)
+            return cached[1]
+
+        if voice_said:
+            self.voice.enqueue_speech("Okay, give me a second to think that through.")
+        parts: list[str] = []
+        buf = ""
+        for piece in self._backend_stream(identity, face_data, user_text):
+            parts.append(piece)
+            buf += piece
+            sentences, buf = _split_sentences(buf)
+            for s in sentences:
+                self.voice.enqueue_speech(s)
+        if buf.strip():
+            self.voice.enqueue_speech(buf.strip())
+        answer = "".join(parts).strip()
+        self._backend_cache[key] = (now, answer)
+        return answer
+
+    @staticmethod
+    def _sentences_of(text: str) -> list[str]:
+        out: list[str] = []
+        rest = text.strip()
+        while rest:
+            sentences, rest = _split_sentences(rest)
+            if not sentences:
+                out.append(rest.strip())
+                break
+            out.extend(sentences)
+        return [s for s in out if s]
+
+    def _record(self, identity: str, answer: str):
+        if not (answer or "").strip():
+            return
+        mem = self.agent._memory_for(identity)
+        mem.add_interaction("assistant", answer.strip())
+        mem.save()
+
+    # ------------------------------------------------------------------
+
+    def maybe_nudge(self, identity: str, face_data: dict) -> bool:
+        """Speak a gentle nudge after long silence (rate-limited)."""
+        if self.busy:
+            return False
+        with self._nudge_lock:
+            idle = time.time() - self.last_activity
+            if idle < self.NUDGE_MINUTES * 60 or self._nudges >= self.MAX_NUDGES:
+                return False
+            self._nudges += 1
+            self.last_activity = time.time()
+        try:
+            mem = self.agent._memory_for(identity)
+            if mem.interaction_count > 1 and mem.persona.purpose:
+                who = mem.persona.name or identity
+                text = f"By the way {who}, earlier you mentioned {str(mem.persona.purpose)[:40]}. How did that go?"
+            else:
+                text = "Still with me? I'm curious what's on your mind today."
+        except Exception:
+            text = "Still with me?"
+        self.voice.enqueue_speech(text)
+        self.history.append({"role": "assistant", "content": text})
+        self.history = self.history[-12:]
+        return True

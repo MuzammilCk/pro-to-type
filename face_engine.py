@@ -82,7 +82,10 @@ class FaceEngine:
         x, y, w, h = [int(v) for v in face[:4]]
         h_frame, w_frame = frame.shape[:2]
         size_ratio = (w * h) / (w_frame * h_frame)
-        confidence = float(face[4]) if len(face) > 4 else 0.5
+        # YuNet face row layout: [x, y, w, h, x_re, y_re, x_le, y_le,
+        # x_nose, y_nose, x_mouth_r, y_mouth_r, x_mouth_l, y_mouth_l,
+        # score]. face[4] is an eye COORDINATE, not the detection score.
+        confidence = float(face[14]) if len(face) > 14 else 0.5
         size_score = min(1.0, size_ratio * 25)  # 4%+ of frame = full marks
         conf_score = max(0.5, min(1.0, confidence))
         blur = self._blur_score(frame, face)
@@ -112,6 +115,21 @@ class FaceEngine:
 
         Returns None if alignment fails (poor landmark quality).
         """
+        face = np.asarray(face, dtype=np.float32).flatten()
+        # B10 fix: SFace's alignCrop() reads the eye/nose/mouth landmarks from
+        # indices 4:14. A box-only array (len<5) makes it silently crop a
+        # head-and-shoulders region; zero landmarks make it "align" a corner
+        # patch. Both produce embeddings of NON-faces — the exact mechanism
+        # behind enrolled faces scoring ~0.28 against themselves. Bail out
+        # instead of embedding garbage; embed() falls back to detect()-fresh
+        # landmarks so live enrollment still works.
+        # 14 = bbox + 10 landmark floats (tracker rebuild); 15 = raw YuNet row
+        # (bbox + landmarks + confidence). Both carry valid landmarks at 4:14.
+        if len(face) < 14:
+            return None
+        lm = face[4:14]
+        if not np.all(np.isfinite(lm)) or np.allclose(lm, 0.0, atol=1e-3):
+            return None
         aligned = self.recognizer.alignCrop(frame, face)
         if aligned is None or aligned.size == 0:
             return None

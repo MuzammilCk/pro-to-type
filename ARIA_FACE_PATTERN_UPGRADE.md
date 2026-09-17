@@ -1,5 +1,15 @@
 # ARIA — Face Structure Pattern Upgrade (Recognition HUD)
 
+> **Behavior note (2026-09, confirmed by owner — FINAL).** The mesh renders
+> on UNRECOGNIZED faces ONLY. It is the "scanning an unknown face"
+> indicator: it appears the moment a face shows up and disappears the moment
+> the system recognizes the person or enrolls them. RECOGNIZED faces get NO
+> rectangle and NO mesh — only a small name caption. The earlier "green box
+> + name" look was explicitly rejected by the owner (it read as clutter).
+> Do NOT reintroduce boxes for authorized faces, do NOT "fix" the
+> disappearing mesh as a bug, and note the tracker absorbs ghost tracks to
+> prevent the same face ever rendering two patterns at once.
+
 Read this alongside `ARIA_ARCHITECTURE.md`, but treat this file as self-contained — the repo has moved on since that file was written, so don't assume the exact file layout it describes still holds.
 
 ## What "modern face structure pattern" means technically

@@ -60,16 +60,17 @@ class FaceTracker:
 
         small_faces = self.face_engine.detect(small)
 
-        # Map downscaled face boxes back to full resolution
+        # Map downscaled face boxes AND landmarks back to full resolution.
+        # B10 fix: landmarks were left in downscaled coords, so alignCrop()
+        # received garbage landmark positions and the SFace embedding was
+        # computed from a misaligned crop — enrolled faces scored ~0.28
+        # against their own templates (below the 0.36 threshold) and were
+        # reported as "unknown" forever.
         scale = 1.0 / downscale_factor if downscale_factor < 1.0 else 1.0
         faces = []
         for face in small_faces:
-            x, y, fw, fh = [float(v) for v in face[:4]]
             face_scaled = face.copy()
-            face_scaled[0] = x * scale
-            face_scaled[1] = y * scale
-            face_scaled[2] = fw * scale
-            face_scaled[3] = fh * scale
+            face_scaled[:14] = face[:14] * scale  # bbox (0:4) + landmarks (4:14)
             faces.append(face_scaled)
 
         now = time.time()
@@ -95,6 +96,11 @@ class FaceTracker:
                 matched.add(best_track_id)
                 track = self.tracks[best_track_id]
                 track["bbox"] = (int(face[0]), int(face[1]), int(face[2]), int(face[3]))
+                # B10 fix: refresh landmarks every re-detection. They were only
+                # stored once at track creation, so the track carried stale
+                # positions from whichever frame created it.
+                if len(face) >= 14:
+                    track["landmarks"] = face[4:14].astype(int).tolist()
                 track["last_seen"] = now
                 track["skip_count"] += 1
                 if track.get("needs_recognition"):
@@ -102,9 +108,23 @@ class FaceTracker:
                     # face, don't also bump skip_count toward a re-recognize
                     track["skip_count"] = 0
 
-                # Re-recognize if track is stale or never recognized
+                # Re-recognize if track is stale or never recognized.
+                # B10 fix: an authorized track whose landmarks moved a lot
+                # (head turn, approach) is re-identified immediately instead
+                # of coasting on the stale identity until the skip counter or
+                # age timer happens to fire — this is what made recognition
+                # appear to "never stick" for authorized faces.
                 time_since_rec = now - track.get("last_recognize", 0)
-                if track["skip_count"] >= self.max_frames_to_skip or time_since_rec > self.max_track_age:
+                moved = False
+                if track.get("authorized") and track.get("last_landmarks"):
+                    moved = self._landmarks_moved(track.get("landmarks", []),
+                                                  track["last_landmarks"],
+                                                  track["bbox"])
+                if moved:
+                    track["skip_count"] = 0
+                    track["last_recognize"] = now
+                    track["needs_recognition"] = True
+                elif track["skip_count"] >= self.max_frames_to_skip or time_since_rec > self.max_track_age:
                     track["skip_count"] = 0
                     track["last_recognize"] = now
                     track["needs_recognition"] = True
@@ -117,7 +137,7 @@ class FaceTracker:
                 tid = f"face_{self._next_id}"
                 self._next_id += 1
                 x, y, fw, fh = [int(v) for v in face[:4]]
-                landmarks = face[4:14].astype(int).tolist() if len(face) > 14 else []
+                landmarks = face[4:14].astype(int).tolist() if len(face) >= 14 else []
                 new_tracks[tid] = {
                     "bbox": (x, y, fw, fh),
                     "last_seen": now,
@@ -127,17 +147,49 @@ class FaceTracker:
                     "score": 0.0,
                     "meta": {},
                     "landmarks": landmarks,
+                    "last_landmarks": list(landmarks),
                     "needs_recognition": True,
                 }
 
         # Check for lost tracks (not seen for a while)
+        # B11 fix: a stale track that overlaps a track seen THIS frame is the
+        # same physical face — when a detection flickers (blur, blink) and the
+        # person moves, the old track used to be kept as a "ghost" AND a new
+        # track spawned for the same face. Two tracks = the landmark pattern
+        # drawn twice for one person (the "duplicated face pattern" bug).
         for tid in list(self.tracks.keys()):
-            if tid not in new_tracks:
-                track = self.tracks[tid]
-                if now - track["last_seen"] < self.max_track_age:
-                    # Keep briefly — might reappear
-                    new_tracks[tid] = track
-                    track["skip_count"] += 1
+            if tid in new_tracks:
+                continue
+            track = self.tracks[tid]
+            if now - track["last_seen"] >= self.max_track_age:
+                continue  # genuinely gone; cleanup_left_faces removes it
+
+            twin_tid = None
+            for live_tid, live_track in new_tracks.items():
+                if self._iou(track["bbox"], live_track["bbox"]) > 0.30:
+                    twin_tid = live_tid
+                    break
+
+            if twin_tid is None:
+                # Keep briefly — might reappear
+                new_tracks[tid] = track
+                track["skip_count"] += 1
+            elif twin_tid in matched:
+                # Twin is the fresher pre-existing track (it has this frame's
+                # detection): drop the ghost entirely.
+                self._miss_streak.pop(tid, None)
+            else:
+                # Twin is a track created THIS frame: keep the OLDER id so
+                # presence/greeting/recognition state stays continuous, take
+                # the twin's fresh geometry, and drop the twin.
+                twin = new_tracks.pop(twin_tid)
+                track["bbox"] = twin["bbox"]
+                track["landmarks"] = twin["landmarks"]
+                track["last_seen"] = now
+                track["skip_count"] = 0
+                if twin.get("needs_recognition"):
+                    track["needs_recognition"] = True
+                new_tracks[tid] = track
 
         # Carry pending-recognition state across the rebuild (B8: a second
         # update() used to wipe it, forcing recognition to run every frame)
@@ -169,7 +221,16 @@ class FaceTracker:
             if not track["needs_recognition"]:
                 continue
             x, y, w, h = track["bbox"]
-            face_data = np.array([x, y, w, h] + track.get("landmarks", []))
+            # B10 fix: the old rebuild assumed exactly 10 landmark floats.
+            # With the box-only fallback ([]) it produced a 4-element array,
+            # and SFace silently treated it as bbox-only coordinates,
+            # destroying the embedding. Pad with zeros instead — see
+            # FaceEngine._extract_aligned, which treats a 4-element array as
+            # "no usable landmarks" and refuses to embed garbage.
+            lm = list(track.get("landmarks", []))
+            if len(lm) < 10:
+                lm = lm + [0] * (10 - len(lm))
+            face_data = np.array([x, y, w, h] + lm, dtype=np.float32)
             identity, score, meta = self.face_engine.identify(frame, face_data)
             threshold = meta.get("threshold", self.face_engine.MATCH_THRESHOLD)
             currently_authorized = track.get("authorized", False)
@@ -178,6 +239,7 @@ class FaceTracker:
                 track["identity"] = identity
                 track["score"] = score
                 track["authorized"] = True
+                track["last_landmarks"] = list(track.get("landmarks", []))
                 self._miss_streak.pop(tid, None)
             elif currently_authorized and score >= threshold - self.hysteresis_margin:
                 # Near-miss while authorized: keep the authorized identity (sticky)
@@ -201,6 +263,31 @@ class FaceTracker:
 
             track["meta"] = meta
             track["needs_recognition"] = False
+
+    @staticmethod
+    def _iou(a: tuple, b: tuple) -> float:
+        """Intersection-over-union of two (x, y, w, h) boxes."""
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        x1, y1 = max(ax, bx), max(ay, by)
+        x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _landmarks_moved(cur: list, prev: list, bbox: tuple) -> bool:
+        """True if any landmark drifted > 25% of the face width since the last
+        successful recognition. Pure guard for the re-identify-on-move path."""
+        if len(cur) < 10 or len(prev) < 10:
+            return False
+        face_w = max(1.0, float(bbox[2]))
+        for i in range(0, 10, 2):
+            if abs(cur[i] - prev[i]) > 0.25 * face_w:
+                return True
+        return False
 
     def _build_results(self) -> list[dict]:
         results = []

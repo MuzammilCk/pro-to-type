@@ -355,6 +355,220 @@ def test_voice_speak_captures_generation_after_interrupt():
 
 
 # ----------------------------------------------------------------------
+# B10 — downscaled landmarks must be rescaled before recognition
+# ----------------------------------------------------------------------
+
+def test_b10_tracker_rescales_landmarks_to_full_resolution():
+    """Landmarks from the downscaled detection frame must be scaled back up.
+
+    Regression: tracker.update() rescaled only the bbox, leaving landmarks in
+    downscaled coords. SFace then aligned on garbage landmark positions and
+    enrolled faces scored ~0.28 against their own templates (threshold 0.36)
+    — authorized faces were never recognized live.
+    """
+    from tracker import FaceTracker
+
+    LM = [30.0, 40.0, 50.0, 40.0, 40.0, 50.0, 30.0, 60.0, 50.0, 60.0]
+
+    class FixedEngine(FakeFaceEngine):
+        def detect(self, frame):
+            # Same coords regardless of input scale — the tracker must
+            # undo its own downscaling.
+            return np.array([[20.0, 20.0, 60.0, 60.0] + LM])
+
+    tr = FaceTracker(FixedEngine())
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    tr.update(frame, downscale_factor=0.5)
+
+    track = next(iter(tr.tracks.values()))
+    got = track["landmarks"]
+    expected = [int(v * 2) for v in LM]
+    assert got == expected, (
+        f"landmarks not rescaled to full resolution: {got} != {expected}"
+    )
+    # bbox must be rescaled too (regression guard for both halves of the fix)
+    assert track["bbox"] == (40, 40, 120, 120)
+
+
+def test_b10_recognize_faces_pads_missing_landmarks():
+    """A track with no landmarks must not produce a 4-element face array.
+
+    Regression: [x,y,w,h] + [] built a 4-element row, and SFace's alignCrop
+    silently mis-cropped it, producing a non-face embedding.
+    """
+    from tracker import FaceTracker
+
+    seen = {}
+
+    class SpyEngine(FakeFaceEngine):
+        def identify(self, frame, face):
+            seen["face"] = np.asarray(face, dtype=np.float32).copy()
+            return "alice", 0.5, {"threshold": 0.36, "quality": 0.8}
+
+    tr = FaceTracker(SpyEngine())
+    tr.tracks["face_0"] = {
+        "bbox": (10, 10, 60, 60),
+        "last_seen": time.time(),
+        "last_recognize": time.time(),
+        "skip_count": 0,
+        "identity": "unknown",
+        "score": 0.0,
+        "meta": {},
+        "landmarks": [],
+        "needs_recognition": True,
+    }
+    tr.recognize_faces(np.zeros((240, 320, 3), dtype=np.uint8))
+    assert seen["face"].size == 14, (
+        f"face array has {seen["face"].size} elements — landmarks not padded"
+    )
+    assert tr.tracks["face_0"]["authorized"] is True
+
+
+def test_b10_engine_rejects_garbage_landmark_rows():
+    """FaceEngine._extract_aligned must refuse to embed non-face alignments."""
+    import os
+
+    if not (os.path.isfile("models/face_detection_yunet_2023mar.onnx")
+            and os.path.isfile("models/face_recognition_sface_2021dec.onnx")):
+        print("      (models not present — skipping)")
+        return
+
+    from face_engine import FaceEngine
+
+    fe = FaceEngine()
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+    # Box-only row (the old 4-element rebuild) must be rejected
+    assert fe._extract_aligned(frame, np.array([10, 10, 60, 60], dtype=np.float32)) is None
+    # Zero landmarks must be rejected
+    assert fe._extract_aligned(
+        frame, np.array([10, 10, 60, 60] + [0] * 10, dtype=np.float32)) is None
+
+
+def test_b10_quality_uses_detection_score_not_eye_x():
+    """_face_quality must read YuNet confidence from index 14, not 4.
+
+    face[4] is the right-eye X coordinate (an int, often > 1.0), which made
+    conf_score clamp to 1.0 for every face and quality worthless.
+    """
+    from face_engine import FaceEngine
+
+    fe = FaceEngine()
+    frame = np.full((240, 320, 3), 128, dtype=np.uint8)
+    # Landmarks with a huge eye-x coordinate, confidence at index 14 = 0.6
+    face = np.array([10, 10, 60, 60, 300, 40, 320, 40, 310, 55,
+                     295, 65, 315, 65, 0.6], dtype=np.float32)
+    q = fe._face_quality(face, frame)
+    # 60x60 on 240x320 = 4.7% of frame -> size_score = 1.0 (0.4 pts).
+    # conf 0.6 -> 0.3*0.6 = 0.18 pts. Flat frame -> blur 0 (0.3 pts lost).
+    # Correct total: ~0.58. The old bug read eye-x=300 as confidence -> 1.0,
+    # giving 0.7. Assert the conf term reflects face[14], not face[4].
+    assert q < 0.7, f"quality saturated ({q}) — still reading face[4] as confidence"
+    assert q >= 0.55, f"quality too low ({q}) — confidence index change broke scoring"
+
+
+# ----------------------------------------------------------------------
+# B11 — one face must never produce two overlapping tracks (duplicate mesh)
+# ----------------------------------------------------------------------
+
+def _scripted_engine(positions):
+    """Engine stub whose detect() yields a scripted list of face rows.
+
+    Each entry is a list of (x, y, w, h) boxes for one frame; [] = no faces.
+    """
+    class ScriptedEngine(FakeFaceEngine):
+        def __init__(self):
+            super().__init__()
+            self.frames = list(positions)
+
+        def detect(self, frame):
+            boxes = self.frames.pop(0) if self.frames else []
+            rows = []
+            for (x, y, w, h) in boxes:
+                cx, cy = x + w // 2, y + h // 2
+                rows.append([float(x), float(y), float(w), float(h),
+                             float(cx - 10), float(cy - 10), float(cx + 10), float(cy - 10),
+                             float(cx), float(cy), float(cx - 8), float(cy + 12),
+                             float(cx + 8), float(cy + 12), 0.9])
+            return np.array(rows) if rows else np.empty((0, 0))
+
+    return ScriptedEngine()
+
+
+def test_b11_ghost_track_absorbed_no_duplicate_pattern():
+    """A stale track overlapping a fresh track of the SAME face must be
+    merged, not kept alongside it.
+
+    Regression: when detection flickered (blur) and a large close-up face
+    moved further than dist_threshold, the old track was kept as a ghost AND
+    a new track spawned — the landmark mesh drew twice for one person.
+    """
+    from tracker import FaceTracker
+
+    # 300x300 face (typical close-up webcam box), moved 120px between
+    # frames: centroid dist 120 > dist_threshold (100) so centroid matching
+    # misses, but IoU = 0.43 > 0.30 so the boxes are obviously the same face.
+    script = [
+        [(10, 10, 300, 300)],   # frame 1: track created
+        [],                      # frame 2: detection flickers -> ghost kept
+        [(130, 10, 300, 300)],  # frame 3: same face re-detected, moved
+    ]
+    tr = FaceTracker(_scripted_engine(script), dist_threshold=100.0)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    tr.update(frame, downscale_factor=1.0)
+    tr.recognize_faces(frame)          # face_0 recognized as unknown
+    tr.update(frame, downscale_factor=1.0)   # flicker
+    results = tr.update(frame, downscale_factor=1.0)  # re-detection after move
+
+    assert len(tr.tracks) == 1, (
+        f"duplicate tracks for one face: {list(tr.tracks)}"
+    )
+    assert len(results) == 1, "results draw more than one pattern for one face"
+    tid = next(iter(tr.tracks))
+    assert tid == "face_0", "older track id must survive for state continuity"
+    assert tr.tracks[tid]["bbox"] == (130, 10, 300, 300), (
+        "merged track must take the fresh geometry"
+    )
+    assert tr.tracks[tid]["needs_recognition"] is True, (
+        "merged track must re-identify (the new geometry was never recognized)"
+    )
+
+
+def test_b11_ghost_dropped_when_twin_is_matched_track():
+    """A ghost overlapping a track that was matched this frame is dropped."""
+    from tracker import FaceTracker
+
+    script = [
+        [(10, 10, 300, 300)],  # face_0 created
+    ]
+    tr = FaceTracker(_scripted_engine(script))
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    tr.update(frame, downscale_factor=1.0)
+    tr.recognize_faces(frame)
+
+    # Inject a ghost (e.g. left over from a previous flicker) on the same face
+    tr.tracks["face_9"] = {
+        "bbox": (40, 20, 300, 300),
+        "last_seen": time.time(),
+        "last_recognize": time.time(),
+        "skip_count": 0,
+        "identity": "unknown",
+        "score": 0.0,
+        "meta": {},
+        "landmarks": [],
+        "needs_recognition": False,
+    }
+
+    script2 = [[(12, 12, 300, 300)]]  # face_0 matched again this frame
+    tr.face_engine.frames = script2
+    tr.update(frame, downscale_factor=1.0)
+
+    assert "face_9" not in tr.tracks, "ghost overlapping a matched track survived"
+    assert "face_0" in tr.tracks
+
+
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items()) if name.startswith("test_")]

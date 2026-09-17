@@ -11,6 +11,9 @@ models/
 # Enrolled faces (runtime data)
 faces/
 
+# Person memory / session state (runtime data)
+persona/
+
 # Environment variables (API keys)
 .env
 
