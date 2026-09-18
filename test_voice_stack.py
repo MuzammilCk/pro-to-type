@@ -169,6 +169,105 @@ def test_speech_queue_flushes_on_interrupt():
 # Phase 1 — MicVAD primitives (no real audio device)
 # ----------------------------------------------------------------------
 
+def test_sarvam_tts_protocol_contract():
+    """The Sarvam WS TTS contract, locked offline with a fake WebSocket.
+
+    Regression for the 2026-09-18 bug: _speak_sarvam sent a REST-style payload
+    as the first message, so Sarvam answered 422 'Input parameters has to be a
+    valid dictionary' on EVERY utterance and playback silently fell back to
+    pyttsx3 (which then crashed with 'run loop already started' under
+    concurrency). The protocol was verified live: config envelope first, then
+    text + flush; audio at data.audio; speaker must be a bulbul:v3 voice.
+    """
+    import asyncio
+    import base64
+    import json as _json
+    import voice as _voice
+
+    sent: list[str] = []
+    audio_b64 = base64.b64encode(b"\x01\x00" * 80).decode()  # 80 int16 samples
+
+    class FakeWS:
+        def __init__(self):
+            self.n = 0
+
+        async def send(self, raw):
+            sent.append(raw)
+
+        async def recv(self):
+            self.n += 1
+            if self.n == 1:
+                return _json.dumps({"type": "audio", "data": {"audio": audio_b64}})
+            if self.n == 2:
+                return _json.dumps({"type": "event", "data": {"event_type": "final"}})
+            raise asyncio.TimeoutError()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    import websockets as _ws_mod
+    orig_connect, orig_ver = _ws_mod.connect, _ws_mod.__version__
+    orig_sink_ok = _voice._HAS_SOUND
+    try:
+        _ws_mod.connect = lambda *a, **k: FakeWS()
+        _voice._HAS_SOUND = False  # skip the audio sink; we only assert protocol
+        v = _voice.SarvamVoice(api_key="test-key")
+        v._speak_sarvam("Hello there", my_gen=v._tts_gen)  # sync method; runs its own loop
+    finally:
+        _ws_mod.connect = orig_connect
+        _ws_mod.__version__ = orig_ver
+        _voice._HAS_SOUND = orig_sink_ok
+
+    msgs = [_json.loads(m) for m in sent]
+    assert len(msgs) >= 3, f"expected config+text+flush, got {len(msgs)} messages"
+    assert msgs[0]["type"] == "config", "first WS message must be the config envelope"
+    cfg = msgs[0]["data"]
+    assert cfg["model"] == "bulbul:v3", "bulbul:v2 is deprecated and rejected by Sarvam"
+    assert cfg["speaker"] not in ("meera", "anushka"), "v2-era speaker name leaked back"
+    assert cfg["target_language_code"] in _voice._SARVAM_TTS_LANGS
+    assert msgs[1] == {"type": "text", "data": {"text": "Hello there"}}
+    assert msgs[2] == {"type": "flush"}
+
+
+def test_local_tts_is_lock_guarded():
+    """The pyttsx3 fallback must serialize through _LOCAL_TTS_LOCK — the
+    'run loop already started' crash came from unsynchronized runAndWait()."""
+    import voice as _voice
+    assert hasattr(_voice, "_LOCAL_TTS_LOCK")
+    from voice import SarvamVoice
+    v = SarvamVoice(api_key=None)
+    assert _voice._LOCAL_TTS_LOCK is not None
+
+
+def test_voicebrain_persona_in_spoken_context():
+    """VoiceBrain._messages must inject persistent memory (name, traits) into
+    the spoken-turn system prompt — that's the conversational-intelligence fix."""
+    from agent import VoiceBrain, VOICE_SYSTEM_PROMPT
+
+    class _FakeMem:
+        class persona:
+            name = "Muzammil"
+            traits = ["likes robotics", "hates slow elevators"]
+            purpose = "building ARIA"
+        interaction_count = 7
+        class episodic:
+            episodes = []
+
+    class _FakeAgent:
+        def _memory_for(self, identity):
+            return _FakeMem()
+
+    brain = VoiceBrain(_FakeAgent())
+    msgs = brain._messages("A quiet room.", [], "hey again", identity="muzammil")
+    sys = msgs[0]["content"]
+    assert "WHAT YOU REMEMBER ABOUT THIS PERSON" in sys
+    assert "Muzammil" in sys and "robotics" in sys
+    assert "WHO YOU ARE" in sys  # the personality prompt is intact
+
+
 def test_mic_vad_utterance_queue():
     from mic_vad import MicVAD
 

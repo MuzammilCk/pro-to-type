@@ -31,6 +31,16 @@ try:
 except ImportError:
     _HAS_TTS_LOCAL = False
 
+# pyttsx3 engines run a COM/loop per runAndWait() call; calling runAndWait()
+# from two threads at once raises "RuntimeError: run loop already started".
+# One shared engine behind a lock serializes all local-fallback playback.
+_LOCAL_TTS_LOCK = threading.Lock()
+_LOCAL_TTS_ENGINE = None
+
+# Languages Sarvam TTS accepts as target_language_code (pipecat-verified map).
+_SARVAM_TTS_LANGS = {"en-IN", "hi-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN",
+                     "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN"}
+
 try:
     import speech_recognition as sr
     _HAS_STT_LOCAL = True
@@ -50,8 +60,12 @@ class SarvamVoice:
       - Auth: header 'api-subscription-key: <key>'
       - STT: send PCM 16-bit mono @16kHz interleaved; receive JSON with
         { " transcript": "...", " is_final": bool, ... }
-      - TTS: send {"text": "...", "language_code": "en-US", "voice": "meera"};
-        receive base64 PCM audio chunks.
+      - TTS: Bulbul v3 protocol (verified against api.sarvam.ai 2026-09):
+          1. send {"type":"config","data":{...}}  voice/model/audio format
+          2. send {"type":"text","data":{"text": ...}}
+          3. send {"type":"flush"}
+          4. receive {"type":"audio","data":{"audio":"<b64 PCM16>"}} chunks
+             until {"type":"event","data":{"event_type":"final"}}
     """
 
     def __init__(self, api_key: str | None = None):
@@ -339,18 +353,27 @@ class SarvamVoice:
                 pass
 
     def _speak_sarvam(self, text: str, my_gen: int | None = None,
-                      voice: str = "meera", speed: float = 1.0):
-        """WebSocket STREAMING TTS with Bulbul.
+                      voice: str | None = None, speed: float = 1.0):
+        """WebSocket STREAMING TTS with Bulbul v3.
 
-        Phase 0 fix: audio plays through an OutputStream as chunks ARRIVE —
-        first sound after ~one network round-trip instead of after the whole
-        utterance downloads (the old code buffered everything, adding the
-        full utterance length of latency). Aborts early if a newer utterance
-        supersedes this one (generation mismatch = barge-in).
+        Protocol (verified live against api.sarvam.ai with this project's key):
+        a config envelope must be sent FIRST, then text + flush; audio arrives
+        as {"type":"audio","data":{"audio":<b64>}} chunks. The old code sent
+        the REST payload as the first message, so the API answered 422 'Input
+        parameters has to be a valid dictionary' and every utterance silently
+        fell back to pyttsx3.
+
+        Audio still plays through an OutputStream as chunks ARRIVE (Phase 0
+        streaming), and aborts early on generation mismatch (barge-in).
         """
         def _stale() -> bool:
             return my_gen is not None and my_gen != self._tts_gen
 
+        speaker = voice or os.getenv("SARVAM_TTS_SPEAKER", "ritu")
+        # self.lang may hold an STT-style code like en-US; TTS needs one of
+        # Sarvam's regional target_language_codes.
+        lang = self.lang if self.lang in _SARVAM_TTS_LANGS else "en-IN"
+        pace = max(0.5, min(2.0, speed))  # bulbul:v3 accepts 0.5-2.0
         stream = None
         played_any = False
 
@@ -370,17 +393,24 @@ class SarvamVoice:
             connect_kwargs = {"additional_headers": headers}
             if websockets.__version__ < "13.0":
                 connect_kwargs = {"extra_headers": headers}
-            async with websockets.connect(_SARVAM_TTS_WS, **connect_kwargs) as ws:
+            url = _SARVAM_TTS_WS + "?model=bulbul:v3"
+            async with websockets.connect(url, **connect_kwargs) as ws:
                 await ws.send(json.dumps({
-                    "text": text,
-                    "language_code": self.lang,
-                    "voice": voice,
-                    "speed": speed,
-                    "sample_rate": 16000,
+                    "type": "config",
+                    "data": {
+                        "target_language_code": lang,
+                        "speaker": speaker,
+                        "model": "bulbul:v3",
+                        "speech_sample_rate": "16000",
+                        "output_audio_codec": "linear16",
+                        "pace": pace,
+                    },
                 }))
+                await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+                await ws.send(json.dumps({"type": "flush"}))
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                        chunk = await asyncio.wait_for(ws.recv(), timeout=6.0)
                     except (asyncio.TimeoutError, websockets.ConnectionClosed):
                         break
                     if _stale():
@@ -388,7 +418,15 @@ class SarvamVoice:
                     if isinstance(chunk, str):
                         data = json.loads(chunk)
                         if data.get("type") == "audio":
-                            _sink(base64.b64decode(data["audio"]))
+                            b64 = (data.get("data") or {}).get("audio", "")
+                            if b64:
+                                _sink(base64.b64decode(b64))
+                        elif data.get("type") == "error":
+                            raise RuntimeError(
+                                (data.get("data") or {}).get("message", "sarvam tts error"))
+                        elif data.get("type") == "event":
+                            if (data.get("data") or {}).get("event_type") == "final":
+                                break
                     elif isinstance(chunk, bytes):
                         _sink(chunk)
 
@@ -410,11 +448,22 @@ class SarvamVoice:
             self._speak_local(text)
 
     def _speak_local(self, text: str):
-        """Local fallback using pyttsx3."""
+        """Local fallback using pyttsx3 (thread-safe).
+
+        pyttsx3's run loop is not re-entrant: calling runAndWait() from two
+        threads at once raises "RuntimeError: run loop already started". All
+        fallback playback is serialized through one shared engine + lock.
+        """
+        global _LOCAL_TTS_ENGINE
         if _HAS_TTS_LOCAL:
-            engine = pyttsx3.init()
-            engine.say(text)
-            engine.runAndWait()
+            with _LOCAL_TTS_LOCK:
+                try:
+                    if _LOCAL_TTS_ENGINE is None:
+                        _LOCAL_TTS_ENGINE = pyttsx3.init()
+                    _LOCAL_TTS_ENGINE.say(text)
+                    _LOCAL_TTS_ENGINE.runAndWait()
+                except Exception:
+                    print(f"[TTS] {text}")
         else:
             print(f"[TTS] {text}")
 

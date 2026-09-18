@@ -324,28 +324,27 @@ class VisionAgentApp:
         return None
 
     def _enroll_with_name(self, conv: ConversationManager, name: str, face_data: dict):
-        """Enroll the visitor under `name`, capturing templates from FRESH frames.
+        """Enroll the visitor under `name` via the Phase-2 enrollment API.
 
-        B4 fix: the old code embedded the SAME frame three times, producing
-        three near-identical templates — useless for multi-angle robustness.
-        Each capture here re-reads the live camera and skips near-duplicates.
+        Captures INDEPENDENT samples from FRESH frames (person moves between
+        captures) and hands them to face_engine.enroll_identity(), which
+        validates quality, duplicates, and coherence centrally. The old
+        "one frame, N embeddings" shortcut can no longer enroll.
         """
-        for attempt in range(3):
+        samples = []
+        for attempt in range(8):  # ~a few seconds of live capture
             frame, face = self._latest_stable_face()
             if frame is not None and face is not None:
-                emb = self.face_engine.embed(frame, face)
-                if emb is not None and len(emb) > 0:
-                    # Skip templates that are near-identical to ones we already have
-                    existing = self.face_engine.known_faces.get(name, [])
-                    if not any(float(np.dot(emb, e)) > 0.995 for e in existing):
-                        self.face_engine.add_template(name, emb)
-                        time.sleep(0.8)  # let the person move naturally between captures
-                    break
-            time.sleep(0.5)
+                samples.append((frame, face))
+                time.sleep(0.6)  # natural movement between captures
+            if len(samples) >= 5:
+                break
 
-        templates = len(self.face_engine.known_faces.get(name, []))
-        if templates == 0:
-            self._speak("I couldn't get a clear look at your face. Let's try that again in a moment.")
+        res = self.face_engine.enroll_identity(name, samples)
+        if not res["enrolled"]:
+            self._speak("I couldn't get enough clear, distinct looks at your face. "
+                        "Let's try that again in better light.")
+            print(f"[Enroll] rejected: {res['reason']} ({res['accepted']}/{res['n_samples']} accepted)")
             conv.reset()
             return
 
@@ -356,7 +355,7 @@ class VisionAgentApp:
         mem.persona.relationship_tier = "trusted"
         mem.persona.purpose = face_data.get("purpose") or "enrolled visitor"
         mem.persona.tags.append("enrolled")
-        mem.add_interaction("system", f"Enrolled as {name} with {templates} templates")
+        mem.add_interaction("system", f"Enrolled as {name} with {res['templates']} validated templates")
         mem.save()
 
         self.memory[name] = mem
@@ -437,8 +436,26 @@ class VisionAgentApp:
                 self._dialogue_loop(conv, name, face_data)
 
             elif evt_type == "person_unrecognized":
-                # B1 fix: the greeting is spoken exactly once. start_for only
-                # builds and returns the text now; playback happens here.
+                # B1 fix: the greeting is built once and spoken once by the
+                # caller (start_for returns text; playback happens here).
+                prev = event.get("previous_identity")
+
+                # Phase 8 — revocation propagation. When the tracker revokes
+                # an identity with a live conversation, the conversation MUST
+                # NOT continue addressing that person by the old name.
+                # Terminate the authenticated dialogue first; fresh face
+                # evidence is the only path back to a named conversation.
+                if prev and prev not in ("", "unknown") and conv.current_identity == prev:
+                    print(f"[Security] '{prev}' lost authorization mid-conversation — "
+                          "suspending authenticated dialogue.")
+                    conv.reset()
+                    if self.vision_ctx is not None:
+                        self.vision_ctx.clear_identity(prev)
+                        self.vision_ctx.add_event(
+                            f"The person who was {prev} is no longer recognized.")
+                    self._speak("Hold on — I've lost track of who you are. "
+                                "Let me take a fresh look.")
+
                 face_data = {
                     "authorized": False,
                     "face_bbox": event.get("face_bbox", (0, 0, 0, 0)),
@@ -466,7 +483,13 @@ class VisionAgentApp:
                     f"{event['authorized']} authorized"
                 )
 
-    def _dialogue_loop(self, conv: ConversationManager, identity: str, face_data: dict):
+    def _identity_currently_authorized(self, identity: str) -> bool:
+        """True iff some live, authorized tracker track currently carries this
+        identity (Phase 8: conversation identity = live face evidence)."""
+        for track in self.tracker.tracks.values():
+            if track.get("authorized") and track.get("identity") == identity:
+                return True
+        return False
         """Shared listen/respond loop for recognized AND unknown visitors.
 
         B5 fix: recognized visitors previously never reached a listen() call,
@@ -486,6 +509,15 @@ class VisionAgentApp:
             conv.current_identity = identity
         if self.session is not None:
             self.session.touch_activity()
+        # Phase 8 synchronous guard: a named dialogue may only continue while
+        # the CURRENT tracker state still authorizes that identity. This
+        # catches revocation even while the conversation thread is blocked in
+        # listen() (the event path only fires between turns).
+        if identity not in ("", "unknown") and not self._identity_currently_authorized(identity):
+            print(f"[Security] '{identity}' is no longer authorized — "
+                  "closing authenticated dialogue.")
+            conv.reset()
+            return
 
         idle_turns = 0
         while conv.state != "IDLE" and not self._stop.is_set():

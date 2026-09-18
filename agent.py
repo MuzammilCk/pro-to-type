@@ -236,12 +236,17 @@ class VisionAgent:
 #   * what ARIA SEES is injected into every spoken turn.
 # ======================================================================
 
-VOICE_SYSTEM_PROMPT = """You are ARIA's speaking voice — a warm, curious AI companion people talk to out loud.
+VOICE_SYSTEM_PROMPT = """You are ARIA's speaking voice — a warm, witty AI companion people talk to out loud, not a search box and not a butler.
+
+WHO YOU ARE
+- You have a personality: curious, playful, a little opinionated. You react like a friend who happens to live in this room.
+- You remember things about the person you're talking to — their name, past chats, small details — and bring them up naturally when relevant.
 
 SPEAKING RULES (critical — this is read aloud by TTS):
-- Reply in 1-2 short sentences. Never more unless directly asked for detail.
-- Plain conversational words only. No markdown, lists, emoji, or symbols.
-- Sound alive: react to what you see, use the person's name when you know it.
+- Reply in 1-3 short sentences the way people actually talk. Never more unless asked for detail.
+- Plain conversational words only. No markdown, lists, emoji, or symbols — commas and pauses only.
+- Be specific and alive: react to what the person actually said, use their name when you know it, reference earlier moments of this conversation.
+- If their message is short small talk, answer like a friend would — with a little color ("Oh, the usual Tuesday chaos?"), not like a service desk.
 - End with ONE light question at most, and not on every turn.
 
 DELEGATION:
@@ -305,8 +310,14 @@ class VisionContext:
                 objects.append(label)
         with self.lock:
             self.objects = objects[:5]
+            # Phase 8: the "known name" is CURRENT-VIEW state only. When no
+            # authorized face is visible (revoked, left, occluded), the name
+            # is cleared — a stale identity must never flow into the
+            # conversation brain.
             if known:
                 self.last_known_name = known[0]
+            else:
+                self.last_known_name = None
             if not face_results and not people:
                 self.summary = "No one is in view right now."
             else:
@@ -324,6 +335,16 @@ class VisionContext:
         with self.lock:
             self.recent_events.append(description)
             self.recent_events = self.recent_events[-5:]
+
+    def clear_identity(self, name: str | None = None):
+        """Drop remembered identity (Phase 8 revocation path).
+
+        With a name: forget it only if it is the one being revoked.
+        Without: drop any remembered name.
+        """
+        with self.lock:
+            if name is None or self.last_known_name == name:
+                self.last_known_name = None
 
     def context_text(self) -> str:
         with self.lock:
@@ -381,20 +402,53 @@ class VoiceBrain:
     def available(self) -> bool:
         return self.agent.llm.available
 
-    def _messages(self, context: str, history: list[dict], user_text: str) -> list[dict]:
-        msgs = [{"role": "system",
-                 "content": VOICE_SYSTEM_PROMPT.format(context=context or "No vision input right now.")}]
-        msgs.extend(history[-6:])
+    def _persona_block(self, identity: str | None) -> str:
+        """Persistent memory about this person, rendered as speakable context.
+
+        Pulled from PersonMemory (persona graph + episodic summaries) so the
+        fast spoken brain can reference past chats like a friend would. Fully
+        defensive: any failure just means no persona block this turn.
+        """
+        if not identity:
+            return ""
+        try:
+            mem = self.agent._memory_for(identity)
+            bits: list[str] = []
+            if mem.persona.name:
+                bits.append(f"Their name is {mem.persona.name}.")
+            if mem.interaction_count:
+                bits.append(f"You have talked {mem.interaction_count} times before.")
+            if mem.persona.traits:
+                bits.append("You remember: " + "; ".join(mem.persona.traits[:5]) + ".")
+            if mem.persona.purpose:
+                bits.append(f"They came by to: {mem.persona.purpose}.")
+            past = [e.get("summary", "") for e in mem.episodic.episodes[-3:]
+                    if isinstance(e, dict) and e.get("summary")]
+            if past:
+                bits.append("Past encounters: " + " | ".join(past))
+            return " ".join(bits)
+        except Exception:  # noqa: BLE001 — persona must never break a spoken turn
+            return ""
+
+    def _messages(self, context: str, history: list[dict], user_text: str,
+                  identity: str | None = None) -> list[dict]:
+        sys = VOICE_SYSTEM_PROMPT.format(context=context or "No vision input right now.")
+        persona = self._persona_block(identity)
+        if persona:
+            sys += "\nWHAT YOU REMEMBER ABOUT THIS PERSON:\n" + persona
+        msgs = [{"role": "system", "content": sys}]
+        msgs.extend(history[-12:])
         msgs.append({"role": "user", "content": user_text})
         return msgs
 
-    def reply_stream(self, context: str, history: list[dict], user_text: str | None) -> Iterator[str]:
+    def reply_stream(self, context: str, history: list[dict], user_text: str | None,
+                     identity: str | None = None) -> Iterator[str]:
         """Yield spoken-turn tokens; sets self.delegated on a [DELEGATE] verdict."""
         self.delegated = False
         prompt = user_text or "(The person just arrived and is looking at you — greet them warmly in one sentence.)"
         llm = self._fast_llm if self._fast_llm is not None else self.agent.llm
         if llm.available:
-            tokens = llm.stream(self._messages(context, history, prompt))
+            tokens = llm.stream(self._messages(context, history, prompt, identity))
         else:
             tokens = iter([self.agent._fallback("unknown", prompt,
                                                 self.agent._memory_for("unknown"))])
@@ -488,7 +542,7 @@ class VoiceSession:
         voice_full = ""   # complete voice-brain text
         pending = ""      # not-yet-spoken remainder
         try:
-            for tok in self.brain.reply_stream(ctx, history, user_text):
+            for tok in self.brain.reply_stream(ctx, history, user_text, identity=identity):
                 voice_full += tok
                 pending += tok
                 sentences, pending = _split_sentences(pending)

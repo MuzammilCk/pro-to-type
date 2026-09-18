@@ -8,6 +8,33 @@ FACES_DIR = "faces"
 
 MIN_FACE_SIZE = 40  # Minimum face dimension in pixels for reliable recognition
 
+# --- Security-rebuild contract (Phase 1) -----------------------------------
+# All three are env-tunable; Phase 11 calibration sets the final values with
+# measured FAR/FRR evidence instead of guesses.
+#   RECOGNITION_THRESHOLD: min cosine similarity to accept an identity.
+#     Kept at OpenCV's 0.36 default for now — baseline-recognition.json shows
+#     genuine median 0.545 vs impostor max 0.173, so there is calibration room.
+#   QUALITY_MIN: floor for face quality. POOR QUALITY NEVER LOWERS THE BAR —
+#     the old adaptive relaxation (threshold - (1-quality)*0.08) is GONE.
+#   MARGIN_MIN: best score must beat second-best identity by this much (when
+#     2+ identities are enrolled) or the match is ambiguous and rejected.
+RECOGNITION_THRESHOLD = float(os.getenv("ARIA_RECOGNITION_THRESHOLD", "0.36"))
+QUALITY_MIN = float(os.getenv("ARIA_QUALITY_MIN", "0.30"))
+MARGIN_MIN = float(os.getenv("ARIA_MARGIN_MIN", "0.05"))
+
+# --- Phase 2: immutable enrollment contract --------------------------------
+# Runtime recognition NEVER writes faces/*.npy. The only writer is
+# enroll_identity(), and only after validation passes:
+#   ENROLL_MIN_SAMPLES   independent captures required (plan: 3 min, 5 ideal)
+#   ENROLL_DUPLICATE_SIM embeddings above this are the SAME sample, not
+#                        independent evidence (blocks "one frame x5")
+#   ENROLL_COHERENCE_MIN median pairwise similarity floor — below it the
+#                        samples do not look like ONE person
+ENROLL_MIN_SAMPLES = int(os.getenv("ARIA_ENROLL_MIN_SAMPLES", "3"))
+ENROLL_TARGET_SAMPLES = 5
+ENROLL_DUPLICATE_SIM = 0.995
+ENROLL_COHERENCE_MIN = 0.40
+
 
 class FaceEngine:
     """SFace face recognition pipeline using OpenCV 5 YuNet + SFace.
@@ -21,10 +48,21 @@ class FaceEngine:
 
     SFace: 37MB model, 128-D embeddings, 95% LFW accuracy on CPU.
     Threshold 0.36 (OpenCV default) tuned for YuNet + 5-landmark alignment.
+
+    Recognition contract (Phase 1 security rebuild):
+      identify() returns (identity, score, meta) where meta carries the FULL
+      decision record:
+        {quality, threshold, score, second_best, margin, margin_required,
+         template_count, authorized, reason}
+      Authorization requires ALL of:
+        valid embedding AND quality >= QUALITY_MIN AND score >= threshold
+        AND (margin >= MARGIN_MIN when 2+ identities enrolled)
+      Low quality NEVER relaxes the threshold — it rejects.
     """
 
     def __init__(self):
-        self.MATCH_THRESHOLD = 0.36
+        # Threshold is module-level config (env-tunable, calibration-set).
+        self.MATCH_THRESHOLD = RECOGNITION_THRESHOLD
         self.detector = cv2.FaceDetectorYN_create(
             FACE_DET_MODEL, "", (320, 320),
             score_threshold=0.5, nms_threshold=0.3, top_k=5000,
@@ -150,38 +188,84 @@ class FaceEngine:
         return emb
 
     def identify(self, frame: np.ndarray, face) -> tuple[str, float, dict]:
-        """Identify a face against known templates.
+        """Identify a face against known templates — full decision record.
 
-        Returns (name, score, metadata) where score is cosine similarity.
-        Matches against ALL stored templates per person and returns the max.
-        Includes quality metadata for adaptive thresholding.
+        Returns (identity, score, meta):
+          identity  best-matching name when authorized; "" when rejected
+                    (callers must treat "" like "unknown")
+          score     best cosine similarity (-1.0 when no valid embedding)
+          meta      {quality, threshold, score, second_best, margin,
+                     margin_required, template_count, authorized, reason}
+
+        Authorization requires ALL of: valid embedding, quality >= QUALITY_MIN,
+        score >= threshold, margin >= MARGIN_MIN (when 2+ identities are
+        enrolled). Poor quality REJECTS — it never relaxes the threshold.
         """
         quality = self._face_quality(face, frame)
+        threshold = self.MATCH_THRESHOLD
+
+        def _reject(reason: str, score: float = -1.0,
+                    second: float | None = None) -> tuple[str, float, dict]:
+            meta = {
+                "quality": round(quality, 3),
+                "threshold": round(threshold, 3),
+                "score": round(score, 4),
+                "second_best": None if second is None else round(second, 4),
+                "margin": None if second is None else round(score - second, 4),
+                "margin_required": MARGIN_MIN if len(self.known_faces) >= 2 else 0.0,
+                "template_count": 0,
+                "authorized": False,
+                "reason": reason,
+            }
+            return "", score, meta
+
         emb = self._extract_aligned(frame, face)
         if emb is None:
-            return "unknown", 0.0, {"quality": quality, "error": "alignment_failed"}
+            return _reject("alignment_failed")
+        if not self.known_faces:
+            return _reject("no_identities_enrolled")
+        if quality < QUALITY_MIN:
+            # Security posture: low quality is EVIDENCE AGAINST — reject with
+            # the threshold intact (the old code lowered the bar instead).
+            return _reject("low_quality")
 
-        # Adapt threshold based on face quality: lower quality → relax threshold slightly
-        adaptive_threshold = self.MATCH_THRESHOLD - (1.0 - quality) * 0.08
-        adaptive_threshold = min(self.MATCH_THRESHOLD, max(0.28, adaptive_threshold))
-
-        best_name, best_score = "unknown", -1.0
+        # Best template per identity, then best/second-best across identities.
+        best_name, best_score, second_best = "", -1.0, -1.0
         for name, templates in self.known_faces.items():
+            person_best = -1.0
             for tmpl in templates:
                 if tmpl.shape != emb.shape:
                     continue
                 # Cosine similarity (dot product on L2-normalized vectors)
                 score = float(np.dot(emb, tmpl))
-                if score > best_score:
-                    best_name, best_score = name, score
+                if score > person_best:
+                    person_best = score
+            if person_best > best_score:
+                second_best = best_score
+                best_name, best_score = name, person_best
+            elif person_best >= second_best:
+                second_best = person_best
 
-        is_authorized = best_score >= adaptive_threshold
-        return (best_name if is_authorized else "unknown", best_score, {
+        meta = {
             "quality": round(quality, 3),
-            "threshold": round(adaptive_threshold, 3),
-            "match": best_score,
+            "threshold": round(threshold, 3),
+            "score": round(best_score, 4),
+            "second_best": None if second_best <= -1.0 else round(second_best, 4),
+            "margin": None if second_best <= -1.0 else round(best_score - second_best, 4),
+            "margin_required": MARGIN_MIN if len(self.known_faces) >= 2 else 0.0,
             "template_count": len(self.known_faces.get(best_name, [])),
-        })
+        }
+
+        if best_score < threshold:
+            meta.update({"authorized": False, "reason": "threshold_rejection"})
+            return "", best_score, meta
+        if meta["second_best"] is not None and meta["margin"] < meta["margin_required"]:
+            # Ambiguous: two identities within MARGIN_MIN — no safe verdict.
+            meta.update({"authorized": False, "reason": "ambiguous_match"})
+            return "", best_score, meta
+
+        meta.update({"authorized": True, "reason": "match"})
+        return best_name, best_score, meta
 
     def add_template(self, name: str, embedding: np.ndarray):
         """Add a face embedding template for a person (multi-template support)."""
@@ -199,16 +283,109 @@ class FaceEngine:
         arr = np.array(self.known_faces[name])
         np.save(os.path.join(FACES_DIR, f"{name}.npy"), arr)
 
-    def capture_templates(self, frame: np.ndarray, face, name: str, count: int = 5) -> int:
-        """Capture multiple face embeddings for robust enrollment.
+    def enroll_identity(self, name: str, samples, *,
+                        min_samples: int = ENROLL_MIN_SAMPLES,
+                        quality_min: float | None = None) -> dict:
+        """Explicit enrollment API — the ONLY path that writes faces/<name>.npy.
 
-        Returns number of templates actually captured.
+        Phase 2 security contract:
+        - Runtime recognition never writes templates; this method is called
+          exclusively by explicit enrollment flows (enroll.py, reenroll.py,
+          run.py voice enrollment).
+        - samples: iterable of (frame, face_row) pairs captured from
+          INDEPENDENT moments (person moved between captures), or plain
+          embedding vectors (ndarray) when the caller has already embedded.
+          Re-embedding one frame N times can NEVER pass: duplicates are
+          dropped by ENROLL_DUPLICATE_SIM and the remainder fails the
+          min_samples gate.
+        - Per-sample validation: embedding validity (alignment + norm),
+          quality >= QUALITY_MIN (poor samples are DISCARDED, never stored).
+        - Set validation: duplicate rejection, diversity/coherence check
+          (median pairwise similarity must sit between 'all identical' and
+          'not one person').
+        - On success it REPLACES the identity's templates with the validated
+          set (a re-enrollment cannot inherit poisoned templates).
+
+        Returns a decision record:
+          {"enrolled": bool, "reason": str, "templates": int,
+           "n_samples": int, "accepted": int,
+           "rejected_low_quality": int, "rejected_invalid": int,
+           "rejected_duplicate": int,
+           "median_intra": float | None, "min_intra": float | None}
         """
-        saved = 0
-        for _ in range(count):
-            emb = self._extract_aligned(frame, face)
-            if emb is not None and len(emb) > 0:
-                self.add_template(name, emb)
-                saved += 1
-            # Small delay would normally go here; in batch mode, just re-extract
-        return saved
+        quality_min = QUALITY_MIN if quality_min is None else quality_min
+        result = {
+            "enrolled": False, "reason": "", "templates": 0,
+            "n_samples": 0, "accepted": 0,
+            "rejected_low_quality": 0, "rejected_invalid": 0,
+            "rejected_duplicate": 0,
+            "median_intra": None, "min_intra": None,
+        }
+
+        accepted: list[np.ndarray] = []
+        samples = list(samples)
+        result["n_samples"] = len(samples)
+        for sample in samples:
+            if isinstance(sample, (tuple, list)):
+                if len(sample) != 2:
+                    result["rejected_invalid"] += 1
+                    continue
+                frame, face = sample
+                emb = self._extract_aligned(frame, face)
+                if emb is None or len(emb) == 0:
+                    result["rejected_invalid"] += 1
+                    continue
+                if self._face_quality(face, frame) < quality_min:
+                    # Poor quality is evidence AGAINST storage — never relax.
+                    result["rejected_low_quality"] += 1
+                    continue
+            else:
+                emb = np.asarray(sample, dtype=np.float32).flatten()
+                norm = np.linalg.norm(emb)
+                if norm < 1e-6:
+                    result["rejected_invalid"] += 1
+                    continue
+                emb = (emb / norm).astype(np.float32)
+
+            # Duplicate detection: near-identical embedding == same sample.
+            if any(float(np.dot(emb, a)) > ENROLL_DUPLICATE_SIM for a in accepted):
+                result["rejected_duplicate"] += 1
+                continue
+            accepted.append(emb)
+
+        result["accepted"] = len(accepted)
+        if len(accepted) < min_samples:
+            result["reason"] = (
+                f"insufficient_valid_samples({len(accepted)}<{min_samples}; "
+                f"dup={result['rejected_duplicate']}, "
+                f"low_q={result['rejected_low_quality']}, "
+                f"invalid={result['rejected_invalid']})"
+            )
+            return result
+
+        # Diversity / coherence over the accepted set.
+        pairwise = [float(np.dot(accepted[i], accepted[j]))
+                    for i in range(len(accepted))
+                    for j in range(i + 1, len(accepted))]
+        if pairwise:
+            med = float(np.median(pairwise))
+            result["median_intra"] = round(med, 4)
+            result["min_intra"] = round(min(pairwise), 4)
+            if med > ENROLL_DUPLICATE_SIM:
+                result["reason"] = "no_diversity"
+                return result
+            if med < ENROLL_COHERENCE_MIN:
+                # Samples don't cohere to ONE person (multi-face capture,
+                # garbage frames, or genuinely different people).
+                result["reason"] = "inconsistent_embeddings"
+                return result
+
+        # Store ONLY validated templates (replace, not append).
+        arr = np.array(accepted, dtype=np.float32)
+        self.known_faces[name] = [a.copy() for a in accepted]
+        os.makedirs(FACES_DIR, exist_ok=True)
+        np.save(os.path.join(FACES_DIR, f"{name}.npy"), arr)
+        result["enrolled"] = True
+        result["reason"] = "ok"
+        result["templates"] = len(accepted)
+        return result

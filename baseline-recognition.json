@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-09-18T17:13:41.120942",
+  "engine_threshold": 0.36,
+  "per_person": {
+    "Muzammil": {
+      "template_count": 5,
+      "dim": 128,
+      "intra_similarity": {
+        "n": 10,
+        "min": 0.3562,
+        "median": 0.545,
+        "max": 0.7544,
+        "outliers": 1,
+        "outlier_sims": [
+          0.3562
+        ]
+      }
+    },
+    "your_name": {
+      "template_count": 3,
+      "dim": 128,
+      "intra_similarity": {
+        "n": 3,
+        "min": 1.0,
+        "median": 1.0,
+        "max": 1.0,
+        "outliers": 0,
+        "outlier_sims": []
+      }
+    }
+  },
+  "cross_person": {
+    "Muzammil|your_name": {
+      "n_pairs": 15,
+      "max": 0.1731,
+      "mean": 0.0917
+    }
+  },
+  "score_dist": {
+    "samples": [
+      {
+        "file": "face_test.jpg",
+        "genuine_identity": "unknown",
+        "best_score": 1.0,
+        "best_identity": "see per-template detail in diag_recognition.py",
+        "threshold_used": 0.36,
+        "quality": 0.973
+      },
+      {
+        "file": "final_test.jpg",
+        "genuine_identity": "unknown",
+        "best_score": 0.7276,
+        "best_identity": "see per-template detail in diag_recognition.py",
+        "threshold_used": 0.36,
+        "quality": 0.965
+      },
+      {
+        "file": "output_pattern_recognized.jpg",
+        "genuine_identity": "unknown",
+        "best_score": 0.9929,
+        "best_identity": "see per-template detail in diag_recognition.py",
+        "threshold_used": 0.36,
+        "quality": 0.973
+      },
+      {
+        "file": "output_pattern_unrecognized.jpg",
+        "genuine_identity": "unknown",
+        "best_score": 0.4805,
+        "best_identity": "see per-template detail in diag_recognition.py",
+        "threshold_used": 0.36,
+        "quality": 0.941
+      }
+    ]
+  }
+}

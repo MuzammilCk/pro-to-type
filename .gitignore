@@ -11,6 +11,11 @@ models/
 # Enrolled faces (runtime data)
 faces/
 
+# Phase 0 security-rebuild backups (immutable data freeze)
+faces_backup_*/
+persona_backup_*/
+.last_backup_stamp
+
 # Person memory / session state (runtime data)
 persona/
 
@@ -19,6 +24,9 @@ persona/
 
 # Output samples
 samples/output_*.jpg
+
+# Generated calibration curve (rerun calibrate_threshold.py to refresh)
+calibration-recognition.json
 
 # OS files
 .DS_Store

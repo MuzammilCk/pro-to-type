@@ -1,36 +1,85 @@
-"""Face tracking with centroid-distance matching + frame-skipping.
+"""Face tracking: Hungarian assignment + evidence-based authorization.
 
-Based on ARIA_ARCHITECTURE.md: 'Track faces frame-to-frame with simple
-centroid-distance matching; only trigger a fresh recognition call when
-a track is new or hasn't matched in a while. Downscale before detection.'
+Security rebuild (Phases 3, 4, 5, 6, 12):
+- Phase 3: global one-to-one detection<->track assignment (scipy Hungarian on
+  cost = alpha*normalized_centroid_distance + beta*(1-IoU)), replacing greedy
+  nearest-match — two faces must never fight over one track.
+- Phase 4: NO sticky authorization. States UNKNOWN/VERIFYING/AUTHORIZED/
+  REVOKING/LOST; authorization requires N strong fresh recognitions, misses
+  degrade the state step by step. Unknown evidence is never discarded.
+- Phase 5: authorized tracks are re-verified on a cadence AND immediately
+  when landmarks move, the bbox jumps, scale changes, or another track
+  approaches — identity never survives on stale evidence.
+- Phase 6: a track ID is NOT proof of identity. A significantly changed
+  track that fails recognition is revoked (old identity dropped), even if
+  it was authorized a moment ago.
+- Phase 12: every recognition emits a [FACE] telemetry line with the full
+  decision record (prev identity/state, scores, margin, transition, reason).
 """
+import os
 import time
 import cv2
 import numpy as np
 from collections import OrderedDict
 
+try:
+    from scipy.optimize import linear_sum_assignment
+    _HAS_SCIPY = True
+except ImportError:  # pragma: no cover - scipy is in the environment
+    _HAS_SCIPY = False
+
+# --- Phase 3: assignment cost model ----------------------------------------
+ALPHA_CENTROID = 0.7
+BETA_IOU = 0.3
+MAX_ASSIGN_COST = 1.0   # normalized; above this a pair is unassignable
+
+# --- Phase 4: temporal confirmation ----------------------------------------
+AUTH_CONFIRMATIONS = 2  # strong positives needed: UNKNOWN -> AUTHORIZED
+REVOKE_LIMIT = 2        # consecutive misses: AUTHORIZED -> REVOKING/UNKNOWN
+VERIFYING_REVOKE_LIMIT = 2  # misses while VERIFYING drop straight to UNKNOWN
+
+# --- Phase 5: re-verification cadence --------------------------------------
+VERIFY_INTERVAL_FRAMES = 5       # recognize at least every N matched frames
+MAX_VERIFICATION_AGE = 0.5       # seconds since last successful recognition
+SCALE_CHANGE_FRAC = 0.25         # bbox area changed >25% -> re-verify
+BBOX_JUMP_FRAC = 0.5             # centroid moved >50% of face size -> re-verify
+PROXIMITY_IOU = 0.10             # another track's bbox overlaps this much
+
+# --- Phase 12: telemetry ----------------------------------------------------
+TELEMETRY = os.getenv("ARIA_FACE_TELEMETRY", "1") not in ("0", "false", "False")
+
+
+def _log_face(msg: str):
+    if TELEMETRY:
+        print(f"[FACE] {msg}")
+
 
 class FaceTracker:
-    """Tracks detected faces across frames using centroid matching.
+    """Tracks faces across frames with global assignment and a security
+    state machine per track.
 
-    - Reuses face ROIs between frames to avoid redundant recognition
-    - Only triggers recognition on new tracks or stale tracks
-    - Frame-skipping: skips detection every N frames on tracked faces
+    Track state dict keys (superset of the old contract):
+      bbox, landmarks, last_landmarks, last_seen, last_recognize,
+      skip_count, needs_recognition,
+      identity, score, meta, authorized,
+      state, positives, misses, last_verify_frame, frames_matched
     """
 
     def __init__(self, face_engine, max_frames_to_skip: int = 5,
                  max_track_age: float = 1.0, dist_threshold: float = 100.0,
-                 hysteresis_margin: float = 0.08, miss_limit: int = 3):
+                 hysteresis_margin: float = 0.08, miss_limit: int = REVOKE_LIMIT):
         self.face_engine = face_engine
         self.max_frames_to_skip = max_frames_to_skip
-        self.max_track_age = max_track_age  # seconds before a face is "left"
-        self.dist_threshold = dist_threshold  # pixels for centroid matching
-        # B9 hysteresis: authorization flips need more evidence than one frame
-        self.hysteresis_margin = hysteresis_margin  # extra similarity needed to REVOKE authorized
-        self.miss_limit = miss_limit  # consecutive clear misses before revoking
-        self._miss_streak: dict[str, int] = {}  # track_id -> consecutive clear-miss count
+        self.max_track_age = max_track_age
+        self.dist_threshold = dist_threshold
+        # Legacy knobs kept so existing callers/tests construct unchanged;
+        # revocation now runs through the state machine (REVOKE_LIMIT).
+        self.hysteresis_margin = hysteresis_margin
+        self.miss_limit = miss_limit
+        self._miss_streak: dict[str, int] = {}  # track_id -> consecutive miss count
+        self._frame_idx = 0
 
-        # Track state: track_id -> dict(bbox, last_seen, last_recognize, skip_count, identity, score, meta)
+        # Track state: track_id -> dict (see class docstring)
         self.tracks: OrderedDict[str, dict] = OrderedDict()
         self._next_id = 0
 
@@ -38,21 +87,69 @@ class FaceTracker:
     def track_count(self) -> int:
         return len(self.tracks)
 
+    # ------------------------------------------------------------------
+    # Phase 3 — global assignment
+    # ------------------------------------------------------------------
+
+    def _cost_matrix(self, tracks: dict[str, dict], faces: list) -> tuple:
+        """cost(track, detection) = alpha*norm_centroid_dist + beta*(1-IoU)."""
+        tids = list(tracks.keys())
+        cost = np.full((len(tids), len(faces)), MAX_ASSIGN_COST + 1.0,
+                       dtype=np.float64)
+        for ti, tid in enumerate(tids):
+            tx, ty, tw, th = tracks[tid]["bbox"]
+            t_cx, t_cy = tx + tw / 2, ty + th / 2
+            for fi, face in enumerate(faces):
+                cx, cy = face[0] + face[2] / 2, face[1] + face[3] / 2
+                dist = float(np.hypot(cx - t_cx, cy - t_cy))
+                # Normalize by dist_threshold so both terms are 0..~1
+                nd = min(1.5, dist / max(1.0, self.dist_threshold))
+                iou = self._iou((tx, ty, tw, th),
+                                (float(face[0]), float(face[1]),
+                                 float(face[2]), float(face[3])))
+                c = ALPHA_CENTROID * nd + BETA_IOU * (1.0 - iou)
+                cost[ti, fi] = c
+        return cost, tids
+
+    @staticmethod
+    def _greedy_fallback(cost: np.ndarray, max_cost: float):
+        """Assignment without scipy: repeatedly take the cheapest pair."""
+        pairs = []
+        cost = cost.copy()
+        while True:
+            r, c = np.unravel_index(np.argmin(cost), cost.shape)
+            if cost[r, c] > max_cost:
+                break
+            pairs.append((int(r), int(c)))
+            cost[r, :] = np.inf
+            cost[:, c] = np.inf
+        return pairs
+
+    def _assign(self, tracks: dict[str, dict], faces: list,
+                max_cost: float = MAX_ASSIGN_COST):
+        """Global one-to-one assignment. Returns list of (tid, face_idx)."""
+        if not tracks or not faces:
+            return []
+        cost, tids = self._cost_matrix(tracks, faces)
+        if _HAS_SCIPY:
+            rows, cols = linear_sum_assignment(cost)
+            pairs = [(int(r), int(c)) for r, c in zip(rows, cols)
+                     if cost[r, c] <= max_cost]
+        else:
+            pairs = self._greedy_fallback(cost, max_cost)
+        return [(tids[r], c) for r, c in pairs]
+
+    # ------------------------------------------------------------------
+    # Main update
+    # ------------------------------------------------------------------
+
     def update(self, frame: np.ndarray, downscale_factor: float = 0.5) -> list[dict]:
-        """Process a frame, return active face results.
+        """Process a frame; returns active face results.
 
-        Args:
-            frame: Full-resolution frame
-            downscale_factor: Fraction to downscale before detection (performance)
-
-        Returns:
-            List of face result dicts with keys:
-            track_id, identity, authorized, score, face_bbox, landmarks,
-            quality, meta, needs_recognition
+        Detection runs on the downscaled frame; boxes AND landmarks are
+        mapped back to full resolution (B10 fix, kept).
         """
         h, w = frame.shape[:2]
-
-        # Run detection on downscaled frame for speed
         if downscale_factor < 1.0:
             small = cv2.resize(frame, (int(w * downscale_factor), int(h * downscale_factor)))
         else:
@@ -60,103 +157,56 @@ class FaceTracker:
 
         small_faces = self.face_engine.detect(small)
 
-        # Map downscaled face boxes AND landmarks back to full resolution.
-        # B10 fix: landmarks were left in downscaled coords, so alignCrop()
-        # received garbage landmark positions and the SFace embedding was
-        # computed from a misaligned crop — enrolled faces scored ~0.28
-        # against their own templates (below the 0.36 threshold) and were
-        # reported as "unknown" forever.
         scale = 1.0 / downscale_factor if downscale_factor < 1.0 else 1.0
         faces = []
         for face in small_faces:
             face_scaled = face.copy()
-            face_scaled[:14] = face[:14] * scale  # bbox (0:4) + landmarks (4:14)
+            face_scaled[:14] = face[:14] * scale
             faces.append(face_scaled)
 
         now = time.time()
+        self._frame_idx += 1
 
-        # Match existing tracks to new detections via centroid distance
-        matched = set()
-        new_tracks = OrderedDict()
+        # --- Phase 3: global assignment (one detection <-> one track) ---
+        pairs = self._assign(self.tracks, faces)
+        matched_tids = {tid for tid, _ in pairs}
+        matched_faces = {fi for _, fi in pairs}
 
-        for face in faces:
-            cx, cy = face[0] + face[2] / 2, face[1] + face[3] / 2
+        new_tracks: OrderedDict[str, dict] = OrderedDict()
+        for tid, fi in pairs:
+            face = faces[fi]
+            track = self.tracks[tid]
+            self._update_track_geometry(track, face, now)
+            new_tracks[tid] = track
 
-            best_track_id = None
-            best_dist = float("inf")
-            for tid, track in self.tracks.items():
-                tx, ty, tw, th = track["bbox"]
-                t_cx, t_cy = tx + tw / 2, ty + th / 2
-                dist = np.sqrt((cx - t_cx) ** 2 + (cy - t_cy) ** 2)
-                if dist < self.dist_threshold and dist < best_dist:
-                    best_dist = dist
-                    best_track_id = tid
+        # Unmatched detections -> new tracks
+        for fi, face in enumerate(faces):
+            if fi in matched_faces:
+                continue
+            tid = f"face_{self._next_id}"
+            self._next_id += 1
+            x, y, fw, fh = [int(v) for v in face[:4]]
+            landmarks = face[4:14].astype(int).tolist() if len(face) >= 14 else []
+            new_tracks[tid] = {
+                "bbox": (x, y, fw, fh),
+                "last_seen": now,
+                "last_recognize": 0,      # force immediate recognition
+                "skip_count": 0,
+                "identity": "unknown",
+                "score": 0.0,
+                "meta": {},
+                "landmarks": landmarks,
+                "last_landmarks": list(landmarks),
+                "needs_recognition": True,
+                # Phase 4 state machine
+                "state": "UNKNOWN",
+                "positives": 0,
+                "last_verify_frame": 0,
+                "frames_matched": 0,
+                "authorized": False,
+            }
 
-            if best_track_id is not None:
-                matched.add(best_track_id)
-                track = self.tracks[best_track_id]
-                track["bbox"] = (int(face[0]), int(face[1]), int(face[2]), int(face[3]))
-                # B10 fix: refresh landmarks every re-detection. They were only
-                # stored once at track creation, so the track carried stale
-                # positions from whichever frame created it.
-                if len(face) >= 14:
-                    track["landmarks"] = face[4:14].astype(int).tolist()
-                track["last_seen"] = now
-                track["skip_count"] += 1
-                if track.get("needs_recognition"):
-                    # Recognition pending — detection already re-confirmed the
-                    # face, don't also bump skip_count toward a re-recognize
-                    track["skip_count"] = 0
-
-                # Re-recognize if track is stale or never recognized.
-                # B10 fix: an authorized track whose landmarks moved a lot
-                # (head turn, approach) is re-identified immediately instead
-                # of coasting on the stale identity until the skip counter or
-                # age timer happens to fire — this is what made recognition
-                # appear to "never stick" for authorized faces.
-                time_since_rec = now - track.get("last_recognize", 0)
-                moved = False
-                if track.get("authorized") and track.get("last_landmarks"):
-                    moved = self._landmarks_moved(track.get("landmarks", []),
-                                                  track["last_landmarks"],
-                                                  track["bbox"])
-                if moved:
-                    track["skip_count"] = 0
-                    track["last_recognize"] = now
-                    track["needs_recognition"] = True
-                elif track["skip_count"] >= self.max_frames_to_skip or time_since_rec > self.max_track_age:
-                    track["skip_count"] = 0
-                    track["last_recognize"] = now
-                    track["needs_recognition"] = True
-                else:
-                    track["needs_recognition"] = False
-
-                new_tracks[best_track_id] = track
-            else:
-                # New track
-                tid = f"face_{self._next_id}"
-                self._next_id += 1
-                x, y, fw, fh = [int(v) for v in face[:4]]
-                landmarks = face[4:14].astype(int).tolist() if len(face) >= 14 else []
-                new_tracks[tid] = {
-                    "bbox": (x, y, fw, fh),
-                    "last_seen": now,
-                    "last_recognize": 0,  # Force immediate recognition
-                    "skip_count": 0,
-                    "identity": "unknown",
-                    "score": 0.0,
-                    "meta": {},
-                    "landmarks": landmarks,
-                    "last_landmarks": list(landmarks),
-                    "needs_recognition": True,
-                }
-
-        # Check for lost tracks (not seen for a while)
-        # B11 fix: a stale track that overlaps a track seen THIS frame is the
-        # same physical face — when a detection flickers (blur, blink) and the
-        # person moves, the old track used to be kept as a "ghost" AND a new
-        # track spawned for the same face. Two tracks = the landmark pattern
-        # drawn twice for one person (the "duplicated face pattern" bug).
+        # Unmatched tracks: ghosts kept briefly, or genuinely lost
         for tid in list(self.tracks.keys()):
             if tid in new_tracks:
                 continue
@@ -171,102 +221,232 @@ class FaceTracker:
                     break
 
             if twin_tid is None:
-                # Keep briefly — might reappear
                 new_tracks[tid] = track
                 track["skip_count"] += 1
-            elif twin_tid in matched:
-                # Twin is the fresher pre-existing track (it has this frame's
-                # detection): drop the ghost entirely.
-                self._miss_streak.pop(tid, None)
+            elif twin_tid in matched_tids:
+                # Twin is the fresher matched track: drop the ghost (B11).
+                pass
             else:
-                # Twin is a track created THIS frame: keep the OLDER id so
-                # presence/greeting/recognition state stays continuous, take
-                # the twin's fresh geometry, and drop the twin.
+                # Twin was created this frame: keep the OLDER id, absorb the
+                # twin's fresh geometry (B11).
                 twin = new_tracks.pop(twin_tid)
                 track["bbox"] = twin["bbox"]
                 track["landmarks"] = twin["landmarks"]
                 track["last_seen"] = now
                 track["skip_count"] = 0
-                if twin.get("needs_recognition"):
-                    track["needs_recognition"] = True
+                track["needs_recognition"] = True
+                # A big geometry change on an authorized track is a Phase 6
+                # signal — the re-verify triggers inside recognize_faces
+                # (proximity/overlap is exactly this merge case) will judge.
                 new_tracks[tid] = track
 
-        # Carry pending-recognition state across the rebuild (B8: a second
-        # update() used to wipe it, forcing recognition to run every frame)
+        # Pending-recognition carry-over (B8, kept)
         for tid, track in new_tracks.items():
             old = self.tracks.get(tid)
-            if old is not None and old.get("needs_recognition") and tid not in matched:
+            if old is not None and old.get("needs_recognition") and tid not in matched_tids:
                 track["needs_recognition"] = True
 
         self.tracks = new_tracks
         return self._build_results()
 
-    def update_results(self) -> list[dict]:
-        """Rebuild results from current track state WITHOUT re-running detection.
+    def _update_track_geometry(self, track: dict, face, now: float):
+        """Refresh geometry + decide if this track needs recognition.
 
-        Used after recognize_faces() so the vision loop doesn't pay for a
-        second full detect+match pass on the same frame (B8 fix).
+        Phase 5 triggers (any one forces re-recognition):
+          - never recognized
+          - skip cadence reached, or verification older than MAX_VERIFICATION_AGE
+          - landmark drift > 25% of face width since last verified position
+          - centroid jumped > BBOX_JUMP_FRAC of the face size
+          - bbox area changed > SCALE_CHANGE_FRAC
+          - another active track's bbox overlaps this one (approach/merge)
+          - the previous round flagged needs_recognition
         """
-        return self._build_results()
+        track["bbox"] = (int(face[0]), int(face[1]), int(face[2]), int(face[3]))
+        if len(face) >= 14:
+            track["landmarks"] = face[4:14].astype(int).tolist()
+        track["last_seen"] = now
+        track["skip_count"] += 1
+        track["frames_matched"] = track.get("frames_matched", 0) + 1
+
+        needs = bool(track.get("needs_recognition"))
+
+        # Cadence / age
+        time_since_rec = now - track.get("last_recognize", 0)
+        if track["skip_count"] >= self.max_frames_to_skip:
+            needs = True
+        if time_since_rec > min(self.max_track_age, MAX_VERIFICATION_AGE) \
+                and track.get("state") == "AUTHORIZED":
+            needs = True
+
+        # Landmark drift since last verified position
+        if track.get("last_landmarks") and self._landmarks_moved(
+                track.get("landmarks", []), track["last_landmarks"], track["bbox"]):
+            needs = True
+
+        # Bbox jump (centroid moved a lot between matched frames)
+        prev_bbox = track.get("prev_bbox")
+        if prev_bbox is not None:
+            px, py = prev_bbox[0] + prev_bbox[2] / 2, prev_bbox[1] + prev_bbox[3] / 2
+            nx, ny = track["bbox"][0] + track["bbox"][2] / 2, track["bbox"][1] + track["bbox"][3] / 2
+            face_size = max(1.0, float(track["bbox"][2]))
+            if np.hypot(nx - px, ny - py) > BBOX_JUMP_FRAC * face_size:
+                needs = True
+            # Scale change
+            prev_area = float(prev_bbox[2]) * float(prev_bbox[3])
+            cur_area = float(track["bbox"][2]) * float(track["bbox"][3])
+            if prev_area > 0 and abs(cur_area - prev_area) / prev_area > SCALE_CHANGE_FRAC:
+                needs = True
+        track["prev_bbox"] = track["bbox"]
+
+        # Proximity of another live track (approach/intersection)
+        if track.get("state") == "AUTHORIZED":
+            for other in self.tracks.values():
+                if other is track:
+                    continue
+                if self._iou(track["bbox"], other["bbox"]) > PROXIMITY_IOU:
+                    needs = True
+                    break
+
+        track["needs_recognition"] = needs
+
+    # ------------------------------------------------------------------
+    # Phase 4/6 — recognition with temporal confirmation
+    # ------------------------------------------------------------------
 
     def recognize_faces(self, frame: np.ndarray):
-        """Run face recognition on all tracks that need it.
+        """Recognize all tracks flagged needs_recognition.
 
-        Applies authorization hysteresis (B9): once a track is authorized,
-        a single bad frame doesn't flip it to unknown — it takes a streak of
-        clear misses. This stops greeting/re-alert chatter when a face turns,
-        blurs, or is briefly occluded.
+        State machine (Phase 4), evidence-based — NO sticky authorization:
+
+          UNKNOWN/VERIFYING
+              positive x AUTH_CONFIRMATIONS -> AUTHORIZED
+              miss                          -> identity dropped to "unknown"
+                                               (unconfirmed evidence never sticks)
+          AUTHORIZED
+              miss < REVOKE_LIMIT           -> stays authorized PROVISIONALLY
+                                               for this round only; verification
+                                               is stale and will re-fire
+              miss >= REVOKE_LIMIT          -> REVOKING: identity dropped NOW
+          REVOKING
+              fresh positive                -> AUTHORIZED (fresh evidence wins)
+              another miss                  -> UNKNOWN
+
+        The miss counter lives in self._miss_streak[track_id] (legacy store,
+        also inspected by tests). Unknown evidence is never discarded: a
+        miss always counts, near or clear.
         """
         for tid, track in self.tracks.items():
             if not track["needs_recognition"]:
                 continue
             x, y, w, h = track["bbox"]
-            # B10 fix: the old rebuild assumed exactly 10 landmark floats.
-            # With the box-only fallback ([]) it produced a 4-element array,
-            # and SFace silently treated it as bbox-only coordinates,
-            # destroying the embedding. Pad with zeros instead — see
-            # FaceEngine._extract_aligned, which treats a 4-element array as
-            # "no usable landmarks" and refuses to embed garbage.
             lm = list(track.get("landmarks", []))
             if len(lm) < 10:
                 lm = lm + [0] * (10 - len(lm))
             face_data = np.array([x, y, w, h] + lm, dtype=np.float32)
             identity, score, meta = self.face_engine.identify(frame, face_data)
-            threshold = meta.get("threshold", self.face_engine.MATCH_THRESHOLD)
-            currently_authorized = track.get("authorized", False)
+            threshold = meta.get("threshold", getattr(self.face_engine, "MATCH_THRESHOLD", 0.36))
+            # Phase-1 contract: engine verdict is authoritative (kept).
+            authorized = meta.get("authorized", score >= threshold)
 
-            if score >= threshold:
-                track["identity"] = identity
+            # Resolve state for tracks missing it (legacy callers/tests that
+            # inject plain authorized tracks): authorized => AUTHORIZED.
+            prev_state = track.get("state") or (
+                "AUTHORIZED" if track.get("authorized") else "UNKNOWN")
+            prev_identity = track.get("identity", "unknown")
+            prev_authorized = track.get("authorized", False)
+
+            if authorized:
+                # Fresh positive evidence.
+                track["positives"] = track.get("positives", 0) + 1
+                self._miss_streak.pop(tid, None)
+                if prev_state in ("AUTHORIZED", "REVOKING"):
+                    # Abundant prior evidence + fresh positive: restore
+                    # immediately (a single miss must not demote a proven
+                    # track to VERIFYING again).
+                    track["state"] = "AUTHORIZED"
+                elif track["positives"] >= AUTH_CONFIRMATIONS:
+                    track["state"] = "AUTHORIZED"
+                else:
+                    track["state"] = "VERIFYING"
+                # Identity follows CURRENT evidence only.
+                track["identity"] = identity or prev_identity
                 track["score"] = score
-                track["authorized"] = True
+                track["authorized"] = track["state"] == "AUTHORIZED"
                 track["last_landmarks"] = list(track.get("landmarks", []))
-                self._miss_streak.pop(tid, None)
-            elif currently_authorized and score >= threshold - self.hysteresis_margin:
-                # Near-miss while authorized: keep the authorized identity (sticky)
-                track["score"] = score
-                track["meta"] = meta
-                self._miss_streak.pop(tid, None)
-            elif currently_authorized:
+                track["last_verify_frame"] = self._frame_idx
+            else:
+                # Miss — near or clear, it counts (unknown evidence is kept).
+                track["positives"] = 0
                 streak = self._miss_streak.get(tid, 0) + 1
                 self._miss_streak[tid] = streak
-                if streak >= self.miss_limit:
-                    track["identity"] = identity
-                    track["score"] = score
+                state = prev_state
+                if state == "AUTHORIZED":
+                    if streak >= REVOKE_LIMIT:
+                        # Phase 6: the identity is dropped NOW. A track ID is
+                        # not proof of identity.
+                        track["state"] = "REVOKING"
+                        track["identity"] = "unknown"
+                        track["authorized"] = False
+                        self._miss_streak.pop(tid, None)
+                    # else: provisional this round; the stale verification
+                    # will re-fire via cadence/age/drift triggers.
+                elif state == "REVOKING":
+                    track["state"] = "UNKNOWN"
+                    track["identity"] = "unknown"
                     track["authorized"] = False
                     self._miss_streak.pop(tid, None)
-                # else: keep previous authorized state this round
-            else:
-                track["identity"] = identity
+                elif streak >= VERIFYING_REVOKE_LIMIT:
+                    track["state"] = "UNKNOWN"
+                    track["identity"] = "unknown"
+                    track["authorized"] = False
+                    self._miss_streak.pop(tid, None)
+                else:
+                    # Never-confirmed identity + a miss: drop the name.
+                    track["identity"] = identity or "unknown"
+                    track["authorized"] = False
                 track["score"] = score
-                track["authorized"] = False
-                self._miss_streak.pop(tid, None)
 
             track["meta"] = meta
             track["needs_recognition"] = False
+            # Recognition just ran: restart the skip cadence and the
+            # verification-age clock (Phase 5).
+            track["skip_count"] = 0
+            track["last_recognize"] = time.time()
+
+            self._telemetry(tid, track, prev_identity, prev_authorized,
+                            prev_state, meta)
+
+    def _telemetry(self, tid: str, track: dict, prev_identity: str,
+                   prev_authorized: bool, prev_state: str, meta: dict):
+        """Phase 12: one [FACE] line per recognition round."""
+        transition = f"{prev_state} -> {track.get('state', '?')}"
+        reason = meta.get("reason", "no_meta")
+        if (prev_identity == track.get("identity")
+                and prev_authorized == track.get("authorized")
+                and prev_state == track.get("state")
+                and reason in ("match", "no_meta")):
+            return  # quiet on stable/uninteresting rounds — noise only on changes
+        _log_face(
+            f"track={tid} "
+            f"previous={prev_identity}/{'authorized' if prev_authorized else 'unknown'} "
+            f"result={track.get('identity', 'unknown')} "
+            f"score={track.get('score', 0.0):.2f} "
+            f"second={meta.get('second_best')} "
+            f"margin={meta.get('margin')} "
+            f"threshold={meta.get('threshold')} "
+            f"quality={meta.get('quality')} "
+            f"transition={transition} "
+            f"reason={reason}"
+        )
+
+    # ------------------------------------------------------------------
+
+    def update_results(self) -> list[dict]:
+        """Rebuild results without re-running detection (B8, kept)."""
+        return self._build_results()
 
     @staticmethod
     def _iou(a: tuple, b: tuple) -> float:
-        """Intersection-over-union of two (x, y, w, h) boxes."""
         ax, ay, aw, ah = a
         bx, by, bw, bh = b
         x1, y1 = max(ax, bx), max(ay, by)
@@ -279,8 +459,6 @@ class FaceTracker:
 
     @staticmethod
     def _landmarks_moved(cur: list, prev: list, bbox: tuple) -> bool:
-        """True if any landmark drifted > 25% of the face width since the last
-        successful recognition. Pure guard for the re-identify-on-move path."""
         if len(cur) < 10 or len(prev) < 10:
             return False
         face_w = max(1.0, float(bbox[2]))
@@ -302,18 +480,17 @@ class FaceTracker:
                 "landmarks": track.get("landmarks", []),
                 "quality": track.get("meta", {}).get("quality", 0.0),
                 "needs_recognition": track.get("needs_recognition", False),
+                "state": track.get("state", "UNKNOWN"),
             })
         return results
 
     def get_left_faces(self, now=None) -> list[str]:
-        """Return track IDs that have been gone for longer than max_track_age."""
         now = now or time.time()
         return [tid for tid, t in self.tracks.items()
                 if now - t["last_seen"] > self.max_track_age]
 
     def cleanup_left_faces(self):
-        """Remove tracks that are no longer visible."""
         now = time.time()
         for tid in self.get_left_faces(now):
-            del self.tracks[tid]
+            self.tracks.pop(tid, None)
             self._miss_streak.pop(tid, None)

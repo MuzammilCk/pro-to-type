@@ -202,6 +202,10 @@ def _tracker_with_track(authorized=True):
         "landmarks": [],
         "needs_recognition": True,
         "authorized": authorized,
+        # Phase-4 state machine: an authorized track IS in the AUTHORIZED
+        # state — provisional-miss grace applies only from there.
+        "state": "AUTHORIZED" if authorized else "UNKNOWN",
+        "positives": 2 if authorized else 0,
     }
     return tr, eng
 
@@ -226,13 +230,193 @@ def test_b9_miss_streak_revokes_authorization():
     assert tr.tracks["face_0"]["identity"] == "unknown"
 
 
-def test_b9_near_miss_keeps_identity():
+def test_p1_near_miss_counts_as_miss_provisional():
+    """Phase-4 contract: a near-miss on an authorized track keeps the identity
+    PROVISIONALLY for this round, but counts toward revocation — the old
+    near-miss-preserved-identity-forever behavior is gone."""
     tr, eng = _tracker_with_track(authorized=True)
-    # 0.32 is below the 0.36 threshold but within the 0.08 margin
-    eng.identify = lambda frame, face: ("alice", 0.32, {"threshold": 0.36})
-    tr.recognize_faces(np.zeros((240, 320, 3), dtype=np.uint8))
+    # 0.32 is below the 0.36 threshold — a miss, near or not
+    eng.identify = lambda frame, face: ("alice", 0.32,
+                                        {"threshold": 0.36, "authorized": False,
+                                         "reason": "threshold_rejection"})
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    tr.recognize_faces(frame)
+    # Provisional this round...
     assert tr.tracks["face_0"]["authorized"] is True
     assert tr.tracks["face_0"]["identity"] == "alice"
+    # ...but the miss was counted
+    assert tr._miss_streak["face_0"] == 1, "near-miss did not count toward revocation"
+
+    tr.tracks["face_0"]["needs_recognition"] = True
+    eng.identify = lambda frame, face: ("", 0.1,
+                                        {"threshold": 0.36, "authorized": False,
+                                         "reason": "threshold_rejection"})
+    tr.recognize_faces(frame)
+    # streak reached miss_limit=2 -> revoked
+    assert tr.tracks["face_0"]["authorized"] is False
+    assert tr.tracks["face_0"]["identity"] == "unknown"
+
+
+def test_p1_engine_verdict_is_authoritative():
+    """A high score with engine-authorized=False (e.g. ambiguous_match) must
+    NOT authorize the track just because score >= threshold."""
+    tr, eng = _tracker_with_track(authorized=False)
+    eng.identify = lambda frame, face: ("", 0.9,
+                                        {"threshold": 0.36, "authorized": False,
+                                         "reason": "ambiguous_match", "score": 0.9})
+    tr.recognize_faces(np.zeros((240, 320, 3), dtype=np.uint8))
+    assert tr.tracks["face_0"]["authorized"] is False, (
+        "track authorized despite the engine's explicit rejection"
+    )
+    assert tr.tracks["face_0"]["identity"] == "unknown"
+
+
+def test_p1_rejected_identity_normalized_to_unknown():
+    """Engine returns "" on rejection; downstream must see "unknown"."""
+    tr, eng = _tracker_with_track(authorized=False)
+    eng.identify = lambda frame, face: ("", 0.2,
+                                        {"threshold": 0.36, "authorized": False})
+    tr.recognize_faces(np.zeros((240, 320, 3), dtype=np.uint8))
+    assert tr.tracks["face_0"]["identity"] == "unknown"
+
+
+# ----------------------------------------------------------------------
+# Phase 1 — face engine decision contract
+# ----------------------------------------------------------------------
+
+_ENGINE = None
+
+
+def _shared_engine():
+    """One real FaceEngine for all contract tests (model load is slow)."""
+    global _ENGINE
+    if _ENGINE is None:
+        from face_engine import FaceEngine
+        _ENGINE = FaceEngine()
+    return _ENGINE
+
+
+def _probe_row(x=10.0, y=10.0, w=160.0, h=160.0, conf=0.9):
+    """A 15-float YuNet-style face row with plausible landmarks."""
+    cx, cy = x + w / 2, y + h / 2
+    return np.array([x, y, w, h,
+                     cx - w * 0.18, cy - h * 0.15,   # right eye
+                     cx + w * 0.18, cy - h * 0.15,   # left eye
+                     cx, cy + h * 0.02,              # nose
+                     cx - w * 0.10, cy + h * 0.22,   # mouth r
+                     cx + w * 0.10, cy + h * 0.22,   # mouth l
+                     conf], dtype=np.float32)
+
+
+def _mix(vec, other, cos_target):
+    """Vector with cosine similarity = cos_target to vec (both normalized)."""
+    ortho = other - np.dot(other, vec) * vec
+    n = np.linalg.norm(ortho)
+    assert n > 1e-6
+    ortho = ortho / n
+    sin_t = (1.0 - cos_target ** 2) ** 0.5
+    out = cos_target * vec + sin_t * ortho
+    return (out / np.linalg.norm(out)).astype(np.float32)
+
+
+def test_p1_identify_meta_contract_and_margin_pass():
+    eng = _shared_engine()
+    frame = np.full((240, 320, 3), 128, dtype=np.uint8)
+    row = _probe_row()
+    probe = eng._extract_aligned(frame, row)
+    assert probe is not None, "probe embedding failed — landmarks/model issue"
+
+    rng = np.random.default_rng(7)
+    other = rng.normal(size=probe.shape).astype(np.float32)
+    other /= np.linalg.norm(other)
+    eng.known_faces = {"alice": [probe],
+                       "bob": [_mix(probe, other, 0.50)]}
+    try:
+        identity, score, meta = eng.identify(frame, row)
+        assert identity == "alice"
+        assert meta["authorized"] is True and meta["reason"] == "match"
+        for key in ("quality", "threshold", "score", "second_best", "margin",
+                    "margin_required", "template_count", "authorized", "reason"):
+            assert key in meta, f"meta missing contract key {key}"
+        assert meta["margin"] >= 0.05, "clear match must clear MARGIN_MIN"
+        assert abs(meta["second_best"] - 0.50) < 0.02, (
+            f"second_best should reflect bob's constructed similarity, got {meta['second_best']}"
+        )
+    finally:
+        eng.known_faces = {}
+
+
+def test_p1_identify_rejects_ambiguous_match():
+    eng = _shared_engine()
+    frame = np.full((240, 320, 3), 128, dtype=np.uint8)
+    row = _probe_row()
+    probe = eng._extract_aligned(frame, row)
+    rng = np.random.default_rng(11)
+    other = rng.normal(size=probe.shape).astype(np.float32)
+    other /= np.linalg.norm(other)
+    # bob sits 0.98 from the probe — inside MARGIN_MIN (0.05) of alice's 1.0
+    eng.known_faces = {"alice": [probe],
+                       "bob": [_mix(probe, other, 0.98)]}
+    try:
+        identity, score, meta = eng.identify(frame, row)
+        assert identity == "", "ambiguous match must not return an identity"
+        assert meta["authorized"] is False
+        assert meta["reason"] == "ambiguous_match"
+        assert meta["score"] >= meta["threshold"], "score cleared the bar — margin must be why"
+        assert meta["margin"] < meta["margin_required"]
+    finally:
+        eng.known_faces = {}
+
+
+def test_p1_identify_low_quality_rejects_with_threshold_intact():
+    eng = _shared_engine()
+    # Tiny face on a big frame + flat (blurred) background -> quality < 0.30
+    frame = np.full((720, 960, 3), 128, dtype=np.uint8)
+    row = _probe_row(x=100.0, y=100.0, w=40.0, h=40.0)
+    rng = np.random.default_rng(3)
+    tmpl = rng.normal(size=128).astype(np.float32)
+    tmpl /= np.linalg.norm(tmpl)
+    eng.known_faces = {"alice": [tmpl]}
+    try:
+        identity, score, meta = eng.identify(frame, row)
+        assert identity == ""
+        assert meta["authorized"] is False
+        assert meta["reason"] == "low_quality"
+        # THE contract: the bar was never lowered
+        assert meta["threshold"] == eng.MATCH_THRESHOLD
+    finally:
+        eng.known_faces = {}
+
+
+def test_p1_identify_threshold_and_edge_cases():
+    eng = _shared_engine()
+    frame = np.full((240, 320, 3), 128, dtype=np.uint8)
+    row = _probe_row()
+
+    # No identities enrolled
+    eng.known_faces = {}
+    identity, score, meta = eng.identify(frame, row)
+    assert identity == "" and meta["reason"] == "no_identities_enrolled"
+
+    # Single identity, orthogonal template -> below threshold
+    rng = np.random.default_rng(5)
+    tmpl = rng.normal(size=128).astype(np.float32)
+    tmpl /= np.linalg.norm(tmpl)
+    eng.known_faces = {"alice": [tmpl]}
+    try:
+        identity, score, meta = eng.identify(frame, row)
+        assert identity == "" and meta["reason"] == "threshold_rejection"
+        assert meta["score"] < meta["threshold"]
+        # <2 identities: margin must not gate
+        assert meta["margin_required"] == 0.0
+        assert meta["second_best"] is None and meta["margin"] is None
+
+        # Alignment failure: box-only row (no landmarks)
+        identity, score, meta = eng.identify(frame, np.array([10, 10, 60, 60], dtype=np.float32))
+        assert identity == "" and meta["reason"] == "alignment_failed"
+        assert meta["authorized"] is False
+    finally:
+        eng.known_faces = {}
 
 
 def test_b9_rematch_clears_streak():
@@ -418,11 +602,19 @@ def test_b10_recognize_faces_pads_missing_landmarks():
         "landmarks": [],
         "needs_recognition": True,
     }
-    tr.recognize_faces(np.zeros((240, 320, 3), dtype=np.uint8))
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    tr.recognize_faces(frame)
     assert seen["face"].size == 14, (
         f"face array has {seen["face"].size} elements — landmarks not padded"
     )
+    # Phase-4 temporal confirmation: one positive arms VERIFYING; a second
+    # strong positive AUTHORIZES. Identity follows current evidence.
+    assert tr.tracks["face_0"]["identity"] == "alice"
+    assert tr.tracks["face_0"]["state"] == "VERIFYING"
+    tr.tracks["face_0"]["needs_recognition"] = True
+    tr.recognize_faces(frame)
     assert tr.tracks["face_0"]["authorized"] is True
+    assert tr.tracks["face_0"]["state"] == "AUTHORIZED"
 
 
 def test_b10_engine_rejects_garbage_landmark_rows():

@@ -17,6 +17,36 @@ python run.py
 > PortAudio; espeak-ng is only needed for the pyttsx3 offline TTS fallback
 > (Windows uses SAPI5 instead).
 
+## Face Authorization Security
+
+Face recognition thresholds are **calibrated, not guessed**. Baseline data lives
+in `baseline-recognition.json`; pair distributions and the FAR/FRR curve are
+written by:
+
+```bash
+python build_baseline.py        # per-person intra / cross-person similarity
+python calibrate_threshold.py   # genuine vs impostor sweep -> FAR/FRR/EER
+```
+
+Tunables (env vars):
+
+```bash
+ARIA_RECOGNITION_THRESHOLD=0.36  # min cosine similarity to authorize (calibrate before changing)
+ARIA_QUALITY_MIN=0.30            # poor quality REJECTS - it never lowers the bar
+ARIA_MARGIN_MIN=0.05             # best must beat 2nd-best identity by this much
+ARIA_ENROLL_MIN_SAMPLES=3        # independent captures required for enrollment
+ARIA_FACE_TELEMETRY=1            # [FACE] decision lines per recognition round
+```
+
+Security invariants (enforced by `test_recognition_security.py`):
+
+- A track ID is **not** proof of identity - revoked tracks drop to "unknown".
+- Authorization requires fresh evidence; misses revoke in 2 rounds.
+- Detection-to-track assignment is one-to-one (Hungarian, not greedy).
+- Runtime recognition **never** writes `faces/*.npy`; only `enroll_identity()`
+  does, and only after duplicate/diversity/quality validation. The old
+  "one frame x 5" enrollment is impossible by construction.
+
 ## Face Pattern HUD
 Unrecognized visitors get a MediaPipe Face Landmarker mesh drawn over their
 actual face boundary (contours style); the moment a face is recognized the

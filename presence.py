@@ -75,10 +75,29 @@ class PresenceManager:
                 track.last_seen = now
                 track.last_score = fr.get("distance", 0.0)
 
-                if track.identity == "unknown" and fr.get("authorized", False):
-                    track.identity = fr["identity"]
-                    track.authorized = True
-                    self._emit_recognized(track_id, fr)
+                # Phase 7 — SYMMETRIC transitions:
+                #   UNKNOWN -> AUTHORIZED : only on fresh authorization
+                #   AUTHORIZED -> UNKNOWN : tracker revoked -> downgrade NOW
+                # The PresenceManager never preserves a previous identity
+                # once the tracker says authorization is gone.
+                if fr.get("authorized", False):
+                    new_id = fr.get("identity", "unknown")
+                    if not track.authorized or track.identity != new_id:
+                        prev = track.identity
+                        if prev not in (None, "unknown", new_id):
+                            # Identity CHANGED on a live track (fresh evidence
+                            # says this is someone else): revoke the old name
+                            # first so any conversation with it terminates.
+                            self._emit_unrecognized(track_id, fr, previous_identity=prev)
+                        track.identity = new_id
+                        track.authorized = True
+                        self._emit_recognized(track_id, fr)
+                elif track.authorized or track.identity != "unknown":
+                    # Tracker explicitly revoked / reclassified this track.
+                    prev = track.identity
+                    track.authorized = False
+                    track.identity = "unknown"
+                    self._emit_unrecognized(track_id, fr, previous_identity=prev)
 
                 if track.greeted and now - track.greeting_time > self.GREETING_COOLDOWN:
                     track.greeted = False
@@ -144,7 +163,8 @@ class PresenceManager:
             "face_bbox": fr.get("face_bbox", (0, 0, 0, 0)),
         })
 
-    def _emit_unrecognized(self, track_id: str, fr: dict):
+    def _emit_unrecognized(self, track_id: str, fr: dict,
+                           previous_identity: str | None = None):
         track = self.tracks.get(track_id)
         if track:
             track.identity = "unknown"
@@ -153,4 +173,7 @@ class PresenceManager:
             "score": fr.get("distance", 0.0),
             "face_bbox": fr.get("face_bbox", (0, 0, 0, 0)),
             "quality": fr.get("quality", 0.0),
+            # Phase 8: who JUST lost the track — lets the conversation layer
+            # terminate an authenticated dialogue for exactly that identity.
+            "previous_identity": previous_identity,
         })
