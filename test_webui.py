@@ -102,6 +102,29 @@ def test_http_endpoints():
         httpd.shutdown()
 
 
+def test_faces_ui_contract_score_key():
+    """run.py builds faces_ui entries from tracker results — the browser HUD
+    reads f.score (tracker's "distance" cosine similarity). If this contract
+    regresses, known faces render as 0% again."""
+    fr = {"identity": "Muzammil", "authorized": True, "distance": 0.62,
+          "face_bbox": (40, 40, 80, 80), "landmarks": [], "quality": 0.8}
+    iw, ih = 640, 480
+    x, y, w, h = fr["face_bbox"]
+    faces_ui = [{
+        "kind": "known" if fr["authorized"] else "stranger",
+        "name": fr.get("identity") or "",
+        "score": fr.get("distance", 0.0),
+        "x": x / iw, "y": y / ih, "w": w / iw, "h": h / ih,
+    }]
+    hub = UiHub()
+    hub.set_faces(faces_ui)
+    entry = hub.snapshot()["faces"][0]
+    assert "score" in entry, "faces_ui entry lost the score key — HUD will show 0%"
+    assert entry["score"] == 0.62
+    # browser math: Math.round((f.score || 0) * 100) + "%"
+    assert round((entry["score"] or 0) * 100) == 62
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

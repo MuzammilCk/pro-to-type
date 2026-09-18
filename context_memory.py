@@ -71,12 +71,20 @@ class PersonaGraph:
 
     @classmethod
     def load(cls, identity: str) -> "PersonaGraph":
-        """Try loading by exact identity, then by common aliases."""
+        """Try loading by exact identity, then the shared daily anon bucket."""
         path = os.path.join(PERSONA_DIR, f"{identity}.json")
         if os.path.exists(path):
             with open(path) as f:
                 return cls.from_dict(json.load(f))
-        # Try "anon_<date>" fallback for unknown faces
+        if identity == "unknown":
+            # save() writes unknown-identity memory to anon_<date>.json —
+            # load it back so stranger facts survive within the same day.
+            anon_path = os.path.join(
+                PERSONA_DIR, f"anon_{datetime.datetime.now().strftime('%Y%m%d')}.json"
+            )
+            if os.path.exists(anon_path):
+                with open(anon_path) as f:
+                    return cls.from_dict(json.load(f))
         return cls(identity)
 
 

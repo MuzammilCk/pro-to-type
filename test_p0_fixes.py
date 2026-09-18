@@ -13,6 +13,7 @@ Covers:
 import threading
 import time
 import queue as queue_mod
+import os
 
 import numpy as np
 
@@ -566,6 +567,50 @@ def test_b11_ghost_dropped_when_twin_is_matched_track():
 
     assert "face_9" not in tr.tracks, "ghost overlapping a matched track survived"
     assert "face_0" in tr.tracks
+
+
+def test_b12_anon_persona_roundtrip():
+    """PersonaGraph.save(identity="unknown") writes anon_<date>.json; load()
+    must read it back the same day (facts learned about a stranger survive).
+    Backs up/restores any real anon file so the user's data is untouched."""
+    import context_memory
+
+    today = context_memory.datetime.datetime.now().strftime("%Y%m%d")
+    anon_path = os.path.join(context_memory.PERSONA_DIR, f"anon_{today}.json")
+    backup = None
+    if os.path.exists(anon_path):
+        with open(anon_path) as f:
+            backup = f.read()
+    try:
+        # also guard against a stale unknown.json shadowing the anon bucket
+        unknown_path = os.path.join(context_memory.PERSONA_DIR, "unknown.json")
+        unknown_backup = None
+        if os.path.exists(unknown_path):
+            with open(unknown_path) as f:
+                unknown_backup = f.read()
+        if os.path.exists(unknown_path):
+            os.remove(unknown_path)
+
+        pg = context_memory.PersonaGraph("unknown")
+        pg.traits = ["wearing glasses", "mentioned printer repair"]
+        pg.purpose = "fixing the coffee machine"
+        pg.save()
+        assert os.path.exists(anon_path), "save(unknown) should write anon_<date>.json"
+
+        loaded = context_memory.PersonaGraph.load("unknown")
+        assert loaded.traits == ["wearing glasses", "mentioned printer repair"], (
+            "anon persona did not survive save->load — memory bug is back")
+        assert loaded.purpose == "fixing the coffee machine"
+
+        if unknown_backup is not None:
+            with open(unknown_path, "w") as f:
+                f.write(unknown_backup)
+    finally:
+        if backup is not None:
+            with open(anon_path, "w") as f:
+                f.write(backup)
+        elif os.path.exists(anon_path):
+            os.remove(anon_path)
 
 
 # ----------------------------------------------------------------------

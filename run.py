@@ -209,6 +209,9 @@ class VisionAgentApp:
                 faces_ui.append({
                     "kind": "known" if is_known else "stranger",
                     "name": fr.get("identity") or "",
+                    # tracker exports match confidence as "distance" (cosine
+                    # similarity — higher is better); same mapping presence.py uses
+                    "score": fr.get("distance", 0.0),
                     "x": x / iw, "y": y / ih, "w": w / iw, "h": h / ih,
                 })
             self.hub.set_faces(faces_ui)
@@ -385,6 +388,8 @@ class VisionAgentApp:
         # Voice session stack (talkative upgrade): VAD mic, split-brain
         # session, vision context, proactive companion.
         self.mic = MicVAD()
+        if not self.mic.start():
+            print("[ARIA] WARNING: microphone unavailable — voice input will not work this session.")
         # Echo guard (pseudo-duplex): while ARIA speaks, the VAD suppresses
         # input so she never transcribes her own voice from the speakers.
         # The same signal drives the UI orb (speaking <-> listening).
