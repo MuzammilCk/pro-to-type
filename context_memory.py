@@ -40,16 +40,17 @@ class PersonaGraph:
         self.preferences: dict[str, Any] = {}
         self.relationship_tier: str = "unknown"  # unknown -> familiar -> trusted
         self.tags: list[str] = []  # e.g. ["delivery", "frequent_visitor", "staff"]
+        self._last_saved_state: dict | None = None
 
     def to_dict(self) -> dict:
         return {
             "identity": self.identity,
             "name": self.name,
             "purpose": self.purpose,
-            "traits": self.traits,
-            "preferences": self.preferences,
+            "traits": list(self.traits),
+            "preferences": dict(self.preferences),
             "relationship_tier": self.relationship_tier,
-            "tags": self.tags,
+            "tags": list(self.tags),
         }
 
     @classmethod
@@ -57,35 +58,55 @@ class PersonaGraph:
         pg = cls(data.get("identity", "unknown"))
         pg.name = data.get("name")
         pg.purpose = data.get("purpose", "")
-        pg.traits = data.get("traits", [])
-        pg.preferences = data.get("preferences", {})
+        pg.traits = list(data.get("traits", []))
+        pg.preferences = dict(data.get("preferences", {}))
         pg.relationship_tier = data.get("relationship_tier", "unknown")
-        pg.tags = data.get("tags", [])
+        pg.tags = list(data.get("tags", []))
+        pg._last_saved_state = pg.to_dict()
         return pg
 
-    def save(self):
-        key = self.identity if self.identity != "unknown" else f"anon_{datetime.datetime.now().strftime('%Y%m%d')}"
-        path = os.path.join(PERSONA_DIR, f"{key}.json")
+    def is_dirty(self) -> bool:
+        if self.identity == "unknown" or self.identity.startswith("anon_"):
+            return False
+        if self._last_saved_state is None:
+            return True
+        return self.to_dict() != self._last_saved_state
+
+    def save(self) -> bool:
+        """Persist persona graph to disk if identity is known and data changed.
+        
+        Unrecognized / stranger identities are session-scoped and non-persistent:
+        they are never written to disk.
+        """
+        if self.identity == "unknown" or self.identity.startswith("anon_"):
+            return False
+        if not self.is_dirty():
+            return False
+        state = self.to_dict()
+        path = os.path.join(PERSONA_DIR, f"{self.identity}.json")
         with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2, default=str)
+            json.dump(state, f, indent=2, default=str)
+        self._last_saved_state = state
+        return True
 
     @classmethod
     def load(cls, identity: str) -> "PersonaGraph":
-        """Try loading by exact identity, then the shared daily anon bucket."""
+        """Try loading by exact identity for known/enrolled individuals.
+        
+        Unknown identities are session-scoped and never loaded from disk.
+        """
+        if identity == "unknown" or identity.startswith("anon_"):
+            pg = cls(identity)
+            pg._last_saved_state = pg.to_dict()
+            return pg
+
         path = os.path.join(PERSONA_DIR, f"{identity}.json")
         if os.path.exists(path):
             with open(path) as f:
                 return cls.from_dict(json.load(f))
-        if identity == "unknown":
-            # save() writes unknown-identity memory to anon_<date>.json —
-            # load it back so stranger facts survive within the same day.
-            anon_path = os.path.join(
-                PERSONA_DIR, f"anon_{datetime.datetime.now().strftime('%Y%m%d')}.json"
-            )
-            if os.path.exists(anon_path):
-                with open(anon_path) as f:
-                    return cls.from_dict(json.load(f))
-        return cls(identity)
+        pg = cls(identity)
+        pg._last_saved_state = pg.to_dict()
+        return pg
 
 
 class PersonMemory:
@@ -108,6 +129,7 @@ class PersonMemory:
         self.last_seen = self.first_seen
         self.interaction_count = 0
         self.session_id = self._generate_session_id()
+        self._last_saved_episodes_count = 0
 
     @staticmethod
     def _generate_session_id() -> str:
@@ -128,6 +150,19 @@ class PersonMemory:
         """Add to persona graph + working context."""
         setattr(self.persona, key, value)
         self.add_interaction("fact", f"{key}: {value}")
+
+    def is_dirty(self) -> bool:
+        """True iff persistent layers (persona graph or episodic memory) have changed.
+        
+        Unknown / stranger identities are session-scoped and never marked dirty for disk.
+        """
+        if self.identity == "unknown" or self.identity.startswith("anon_"):
+            return False
+        if self.persona.is_dirty():
+            return True
+        if len(self.episodic.episodes) != self._last_saved_episodes_count:
+            return True
+        return False
 
     def to_dict(self) -> dict:
         return {
@@ -152,26 +187,42 @@ class PersonMemory:
         mem.last_seen = data.get("last_seen", mem.last_seen)
         mem.interaction_count = data.get("interaction_count", 0)
         mem.session_id = data.get("session_id", mem.session_id)
+        mem._last_saved_episodes_count = len(mem.episodic.episodes)
         return mem
 
-    def save(self):
-        """Persist persona graph + episodic memory. Working context is session-only."""
+    def save(self) -> bool:
+        """Persist persona graph + episodic memory if changed. Working context is session-only.
+        
+        Unrecognized / stranger identities are session-scoped and non-persistent:
+        never written to disk.
+        """
+        if self.identity == "unknown" or self.identity.startswith("anon_"):
+            return False
+        if not self.is_dirty():
+            return False
         self.persona.save()
         # Save episodic summary file too
         epi_path = os.path.join(PERSONA_DIR, f"{self.identity}_episodes.json")
         with open(epi_path, "w") as f:
             json.dump({"episodes": self.episodic.episodes}, f, indent=2)
+        self._last_saved_episodes_count = len(self.episodic.episodes)
+        return True
 
     @classmethod
     def load(cls, identity: str) -> "PersonMemory":
-        """Load persistent layers; working context starts empty for new session."""
+        """Load persistent layers; working context starts empty for new session.
+        
+        Unknown identities are always initialized fresh and not loaded from disk.
+        """
         mem = cls(identity)
-        mem.persona = PersonaGraph.load(identity)
-        # Restore episodic memory if available
-        epi_path = os.path.join(PERSONA_DIR, f"{identity}_episodes.json")
-        if os.path.exists(epi_path):
-            with open(epi_path) as f:
-                mem.episodic.episodes = json.load(f).get("episodes", [])
+        if identity != "unknown" and not identity.startswith("anon_"):
+            mem.persona = PersonaGraph.load(identity)
+            # Restore episodic memory if available
+            epi_path = os.path.join(PERSONA_DIR, f"{identity}_episodes.json")
+            if os.path.exists(epi_path):
+                with open(epi_path) as f:
+                    mem.episodic.episodes = json.load(f).get("episodes", [])
+            mem._last_saved_episodes_count = len(mem.episodic.episodes)
         return mem
 
 

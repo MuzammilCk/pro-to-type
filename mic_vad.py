@@ -97,7 +97,10 @@ class MicVAD:
         while time.time() < deadline:
             with self._lock:
                 if self._utterances:
-                    return self._utterances.popleft()
+                    utt = self._utterances.popleft()
+                    dur = len(utt) / float(self.SAMPLE_RATE)
+                    print(f"[MicVAD] Utterance dequeued: {dur:.2f}s ({len(utt)} samples, remaining in queue: {len(self._utterances)})")
+                    return utt
             self._utterance_event.wait(timeout=0.1)
             self._utterance_event.clear()
         return None
@@ -139,13 +142,11 @@ class MicVAD:
                 continue
             frame = audio[:, 0]
             rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
-            ringing.append(rms)
-            if len(ringing) >= 10:
-                self._noise_floor = max(80.0, float(np.median(ringing)))
-
             if self.speaking:
                 # Echo guard: ARIA is talking — reset turn state and keep only
                 # the pre-roll so a user interrupt mid-speech is still caught.
+                if in_speech:
+                    print("[MicVAD] Echo guard active: suppressing in-flight utterance because ARIA is speaking")
                 in_speech = False
                 speech_frames = silence_frames = 0
                 buf = []
@@ -154,6 +155,16 @@ class MicVAD:
 
             is_speech = rms > self._noise_floor * self.speech_threshold
             self.in_speech = in_speech
+
+            # Only adapt the noise floor during ambient silence, never during active
+            # speech or speech-onset candidates. Otherwise the floor tracks the
+            # speaker's voice, the gate skyrockets (e.g. 80 -> 3500 -> 9000), and
+            # subsequent words in the same sentence are falsely cut off as "silence".
+            if not in_speech and not is_speech:
+                ringing.append(rms)
+                if len(ringing) >= 10:
+                    self._noise_floor = max(80.0, float(np.median(ringing)))
+
             if self.debug and int(time.time() * 5) != getattr(self, "_dbg_tick", -1):
                 self._dbg_tick = int(time.time() * 5)
                 print(f"[VAD] rms={rms:7.1f} floor={self._noise_floor:6.1f} "
@@ -170,16 +181,22 @@ class MicVAD:
                         silence_frames = 0
                         buf = list(pre_roll)
                         pre_roll.clear()
+                        print(f"[MicVAD] Speech onset confirmed (rms={rms:.1f}, floor={self._noise_floor:.1f}, gate={self._noise_floor * self.speech_threshold:.1f})")
                 else:
                     speech_frames = 0
             else:
                 buf.append(frame)
                 silence_frames = 0 if is_speech else silence_frames + 1
                 if silence_frames * self.FRAME_MS >= self.silence_ms:
-                    self._emit(buf[:-silence_frames] if silence_frames else buf)
+                    emitted = buf[:-silence_frames] if silence_frames else buf
+                    dur = len(emitted) * self.FRAME_MS / 1000.0
+                    print(f"[MicVAD] Silence detected ({silence_frames * self.FRAME_MS:.0f}ms >= {self.silence_ms:.0f}ms). Closing utterance ({dur:.2f}s).")
+                    self._emit(emitted)
                     in_speech, buf = False, []
                     speech_frames = silence_frames = 0
                 elif len(buf) >= max_frames:
+                    dur = len(buf) * self.FRAME_MS / 1000.0
+                    print(f"[MicVAD] Max utterance length reached ({dur:.2f}s). Closing utterance.")
                     self._emit(buf)
                     in_speech, buf = False, []
                     speech_frames = silence_frames = 0
@@ -198,7 +215,10 @@ class MicVAD:
         rms = np.sqrt(np.mean((pcm.astype(np.float32) / 32768.0) ** 2, axis=1)
                       if pcm.ndim > 1 else (pcm.astype(np.float32) / 32768.0) ** 2)
         if float(np.max(rms)) <= 0:
+            print("[MicVAD] Discarded near-zero RMS utterance")
             return
         with self._lock:
             self._utterances.append(pcm)
+        dur = len(pcm) / float(self.SAMPLE_RATE)
+        print(f"[MicVAD] Emitted utterance to queue: {dur:.2f}s ({len(pcm)} samples, queue_len={len(self._utterances)})")
         self._utterance_event.set()

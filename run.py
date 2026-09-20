@@ -20,11 +20,15 @@ import datetime
 # Auto-load .env for direct `python run.py` execution
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.exists(_env_path):
-    for line in open(_env_path):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    _dotenv = {}
+    with open(_env_path) as _f:
+        for line in _f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                _dotenv[k.strip()] = v.strip()
+    for k, v in _dotenv.items():
+        os.environ.setdefault(k, v)
 
 import numpy as np
 
@@ -42,6 +46,7 @@ from mic_vad import MicVAD
 from companion import ProactiveEngine
 from context_memory import PersonMemory, SessionManager
 from webui import UiHub, serve, render_jpeg
+from events import Event, EventType
 
 
 CONFIG = {
@@ -83,6 +88,7 @@ class VisionAgentApp:
         self.vision_events: queue.Queue = queue.Queue()
         self.action_events: queue.Queue = queue.Queue()
         self._stop = threading.Event()
+        self._farewells_spoken: set[str] = set()
 
         # Restore session state
         saved = SessionManager.load_current_state()
@@ -399,6 +405,8 @@ class VisionAgentApp:
         self.voice.set_speaking_callback(_echo_guard)
         # Web UI transcript: every spoken line and heard turn lands in the rail
         self.voice.set_ui_hooks(on_say=self.hub.say, on_heard=self.hub.heard)
+        # Phase 2: wire voice events (USER_UTTERANCE, AGENT_*_SPEAKING) into action_events queue
+        self.voice.set_event_queue(self.action_events)
         self.vision_ctx = VisionContext()
         self.session = VoiceSession(self.agent, self.voice, mic=self.mic,
                                     vision=self.vision_ctx)
@@ -414,10 +422,15 @@ class VisionAgentApp:
 
             evt_type = event.get("type", "")
 
-            if evt_type == "person_recognized":
+            if evt_type == EventType.PERSON_ENTERED:
+                # Arrival noted; follow-up IDENTITY_CONFIRMED or person_unrecognized handles greeting
+                pass
+
+            elif evt_type == EventType.IDENTITY_CONFIRMED:
                 # B5 fix: greet known people, then LISTEN — they get a dialogue,
                 # not a monologue followed by silence.
                 name = event.get("name", "friend")
+                self._farewells_spoken.discard(name)
                 track_id = event.get("track_id", "")
                 face_data = {
                     "authorized": True,
@@ -436,6 +449,7 @@ class VisionAgentApp:
                 self._dialogue_loop(conv, name, face_data)
 
             elif evt_type == "person_unrecognized":
+                self._farewells_spoken.discard("unknown")
                 # B1 fix: the greeting is built once and spoken once by the
                 # caller (start_for returns text; playback happens here).
                 prev = event.get("previous_identity")
@@ -470,11 +484,8 @@ class VisionAgentApp:
                 self._speak(greeting)
                 self._dialogue_loop(conv, "unknown", face_data)
 
-            elif evt_type == "person_left":
-                conv.reset()
-                if self.mic is not None:
-                    self.mic.clear_pending()
-                self.voice.speak_async("Goodbye! Come back soon.")
+            elif evt_type == EventType.PERSON_LEFT:
+                self._handle_person_left(event, conv)
 
             elif evt_type == "frame_summary":
                 self._status_text = (
@@ -483,6 +494,38 @@ class VisionAgentApp:
                     f"{event['authorized']} authorized"
                 )
 
+    def _handle_person_left(self, event: dict, conv) -> None:
+        name = event.get("name") or event.get("identity", "")
+        # Prefer the persona display name stored in memory over the raw
+        # identity key (which may be "MuzammilCK" vs "Muzammil").
+        try:
+            mem = self.agent._memory_for(name)
+            display = (mem.persona.name or name) if mem else name
+        except Exception:
+            display = name
+        farewell = (
+            f"See you later, {display}. Take care!"
+            if display and display not in ("", "unknown")
+            else "Goodbye! Come back anytime."
+        )
+        conv.reset()
+        if self.mic is not None:
+            self.mic.clear_pending()
+        key = name if name and name not in ("", "unknown") else "unknown"
+        # Track churn guard: if the identity is still authorized on a
+        # *different* live track (e.g. face_0 expired but face_12 is
+        # already confirmed as the same person), the person hasn't
+        # actually left — suppress the farewell and leave the hub state
+        # alone so the active dialogue continues uninterrupted.
+        if name and name not in ("", "unknown") and self._identity_currently_authorized(name):
+            pass  # person still present on another track — no farewell
+        elif key in self._farewells_spoken:
+            pass  # farewell already spoken for this identity since last confirmation
+        else:
+            self._farewells_spoken.add(key)
+            self.hub.set_aria_state("idle")
+            self.voice.speak_async(farewell)
+
     def _identity_currently_authorized(self, identity: str) -> bool:
         """True iff some live, authorized tracker track currently carries this
         identity (Phase 8: conversation identity = live face evidence)."""
@@ -490,6 +533,8 @@ class VisionAgentApp:
             if track.get("authorized") and track.get("identity") == identity:
                 return True
         return False
+
+    def _dialogue_loop(self, conv, identity, face_data):
         """Shared listen/respond loop for recognized AND unknown visitors.
 
         B5 fix: recognized visitors previously never reached a listen() call,
@@ -521,11 +566,26 @@ class VisionAgentApp:
 
         idle_turns = 0
         while conv.state != "IDLE" and not self._stop.is_set():
+            # Prompt departure check: exit immediately if vision confirms room is empty.
+            # Do NOT speak a farewell here — the PERSON_LEFT event that caused this
+            # condition is already queued in vision_events and will be dequeued by
+            # conversation_thread as soon as this method returns, producing the
+            # farewell exactly once via the PERSON_LEFT handler.
+            if self.vision_ctx is not None and "No one is in view" in self.vision_ctx.context_text():
+                conv.reset()
+                self.hub.set_aria_state("idle")
+                break
+
             timeout = 12.0 if self.mic is not None else 12.0
             self.hub.set_aria_state("listening")
             transcript = self.voice.listen(timeout=timeout, phrase_limit=8,
                                            mic=self.mic)
             if not transcript:
+                # Re-check presence right after timeout before burning another idle turn
+                if self.vision_ctx is not None and "No one is in view" in self.vision_ctx.context_text():
+                    conv.reset()
+                    self.hub.set_aria_state("idle")
+                    break
                 idle_turns += 1
                 if conv.state == "ENROLLING":
                     continue

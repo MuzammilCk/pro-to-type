@@ -12,6 +12,8 @@ import queue
 from dataclasses import dataclass, field
 from typing import Any
 
+from events import Event, EventType
+
 
 @dataclass
 class TrackState:
@@ -63,7 +65,7 @@ class PresenceManager:
                     last_seen=now,
                     last_score=fr.get("distance", 0.0),
                 )
-                self._emit("person_entered", track_id, fr)
+                self._emit(EventType.PERSON_ENTERED, track_id, fr)
 
                 if fr.get("authorized", False):
                     self._emit_recognized(track_id, fr)
@@ -107,7 +109,7 @@ class PresenceManager:
                 track = self.tracks[tid]
                 if now - track.last_seen > 2.0 and not track.left:
                     track.left = True
-                    self._emit("person_left", tid, {
+                    self._emit(EventType.PERSON_LEFT, tid, {
                         "track_id": tid,
                         "identity": track.identity,
                         "duration": now - track.first_seen,
@@ -134,13 +136,16 @@ class PresenceManager:
             return time.time() - track.greeting_time > self.GREETING_COOLDOWN
         return True
 
-    def _emit(self, event_type: str, track_id: str, data: dict):
-        self.event_queue.put({
-            "type": event_type,
-            "track_id": track_id,
-            "timestamp": time.time(),
-            **data,
-        })
+    def _emit(self, event_type: EventType | str, track_id: str, data: dict):
+        if isinstance(event_type, str):
+            evt_type = EventType(event_type) if event_type in EventType._value2member_map_ else event_type
+        else:
+            evt_type = event_type
+
+        event = Event(type=evt_type, data={"track_id": track_id, **data}, timestamp=time.time())
+        t_name = evt_type.name if isinstance(evt_type, EventType) else str(evt_type)
+        print(f"[EVENT] {t_name}: track_id={track_id}")
+        self.event_queue.put(event)
 
     def _emit_recognized(self, track_id: str, fr: dict):
         # Identity-level cooldown: suppress the event if this person was
@@ -157,7 +162,7 @@ class PresenceManager:
                 return
         if track:
             track.greeted = False
-        self._emit("person_recognized", track_id, {
+        self._emit(EventType.IDENTITY_CONFIRMED, track_id, {
             "name": name,
             "score": fr.get("distance", 0.0),
             "face_bbox": fr.get("face_bbox", (0, 0, 0, 0)),

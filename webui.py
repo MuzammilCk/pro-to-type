@@ -111,12 +111,15 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code: int, body: bytes, ctype: str):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def do_GET(self):
         if self.path == "/":
@@ -130,13 +133,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def _stream_mjpeg(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=ariaframe")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        last_seq = -1
-        stale_repeats = 0
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=ariaframe")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            last_seq = -1
+            stale_repeats = 0
             while True:
                 jpeg = self.hub.latest_jpeg()
                 if jpeg is None:
@@ -156,7 +159,7 @@ class _Handler(BaseHTTPRequestHandler):
                     b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
                     + jpeg + b"\r\n")
                 time.sleep(0.033)  # ~30 fps ceiling; vision loop sets real pace
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
 

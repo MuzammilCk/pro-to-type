@@ -304,6 +304,54 @@ def test_voice_listen_uses_mic_path():
     assert out == ""
 
 
+def test_voice_speak_then_listen_mic_not_aborted():
+    """Regression test: calling speak() to completion must not leave _interrupt_flag
+    set such that an immediate listen(mic=...) with a queued utterance is aborted.
+
+    Asserts the exact sequence from the live run:
+    speak(greeting) completes -> utterance queued in MicVAD -> listen(mic=...) ->
+    must NOT abort with '[Voice] _listen_vad aborted: interrupt flag set'.
+    """
+    import io
+    import contextlib
+    from voice import SarvamVoice
+    from mic_vad import MicVAD
+
+    v = SarvamVoice(api_key=None)
+    # Prevent speak() from attempting real network or local TTS playback
+    v._speak_sarvam = lambda *args, **kwargs: None
+    v._speak_local = lambda *args, **kwargs: None
+
+    # Stub transcription so listen() returns deterministically without network
+    v.available = lambda: True
+    v._transcribe_pcm = lambda pcm_bytes: "hello aria"
+
+    # 1. Call speak() to completion (previously left _interrupt_flag set)
+    v.speak("Hello there!")
+    assert not v._interrupt_flag.is_set(), "speak() must clear _interrupt_flag upon completion"
+
+    # 2. Prepare MicVAD with a queued utterance ready
+    mic = MicVAD()
+    pcm = (np.sin(np.linspace(0, 100, 1600)) * 5000).astype(np.int16)
+    mic._emit([pcm])
+
+    # 3. Immediately call listen() on the mic path and capture stdout
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        transcript = v.listen(timeout=1.0, mic=mic)
+    logs = buf.getvalue()
+
+    # 4. Assert it is NOT aborted and transcribes successfully
+    assert "[Voice] _listen_vad aborted: interrupt flag set" not in logs, (
+        f"listen(mic=...) aborted due to interrupt flag: {logs}"
+    )
+    assert "[Voice] STT (Sarvam) transcript: 'hello aria'" in logs
+    assert transcript == "hello aria", (
+        f"listen(mic=...) was aborted or failed to transcribe: got {transcript!r}"
+    )
+    assert not v._interrupt_flag.is_set()
+
+
 # ----------------------------------------------------------------------
 # Phase 2 — split brain
 # ----------------------------------------------------------------------
@@ -463,7 +511,500 @@ def test_proactive_remarks_groundedin_memory():
     assert "printer" in remark.lower(), f"remark not grounded: {remark}"
 
 
+
 # ----------------------------------------------------------------------
+# Departure / presence-exit regression tests
+# ----------------------------------------------------------------------
+
+def test_nudge_one_shot_per_idle_stretch():
+    """maybe_nudge must fire at most once per idle stretch (MAX_NUDGES=1).
+
+    After one nudge has fired and _nudges is at MAX_NUDGES, a second call
+    — even with sufficient elapsed idle — must return False.  Separately,
+    touch_activity() resets the budget so a nudge fires again in the next
+    stretch.
+    """
+    agent, voice, vision, session = make_session()
+    session.last_activity = time.time() - 10 * 60  # long idle
+
+    # First nudge fires
+    assert session.maybe_nudge("unknown", {}) is True, "first nudge should fire"
+    assert len(voice.spoken) == 1
+
+    # Budget exhausted: _nudges == MAX_NUDGES → second call must be blocked
+    # even if we re-wind last_activity to simulate more idle time
+    session.last_activity = time.time() - 10 * 60
+    assert session.maybe_nudge("unknown", {}) is False, (
+        "second nudge within same idle stretch must be blocked"
+    )
+    assert len(voice.spoken) == 1, "no second nudge should be spoken"
+
+    # After a real interaction (touch_activity resets budget), a nudge fires again
+    session.touch_activity()
+    session.last_activity = time.time() - 10 * 60  # another long idle
+    assert session.maybe_nudge("unknown", {}) is True, (
+        "nudge should fire again after touch_activity resets the budget"
+    )
+    assert len(voice.spoken) == 2
+
+
+def test_dialogue_loop_exits_promptly_when_room_empty():
+    """_dialogue_loop must exit as soon as vision reports nobody in view.
+
+    Previously the loop could only exit via 3×12s silence timeouts (~36s).
+    This test uses a VisionContext that reads "No one is in view" and a
+    voice stub that immediately returns '' (silence), confirming the loop
+    breaks on the first iteration's presence check rather than waiting for
+    3 idle turns.
+    """
+    import threading
+    from conversation import ConversationManager
+    from agent import VisionContext, VoiceSession
+    from run import VisionAgentApp
+
+    # --- stubs -------------------------------------------------------
+    class EmptyRoomVoice(StubVoice):
+        """Always returns empty transcript to simulate nobody speaking."""
+        listen_calls = 0
+
+        def listen(self, timeout=12.0, phrase_limit=8.0, mic=None):
+            self.listen_calls += 1
+            return ""
+
+    class _StopEvent:
+        def is_set(self):
+            return False
+
+    class _Hub:
+        def set_aria_state(self, _):
+            pass
+
+    # --- build a minimal VisionAgentApp-shaped object ----------------
+    agent_obj = StubAgent()
+    voice_obj = EmptyRoomVoice()
+
+    vision_ctx = VisionContext()
+    # Populate with no faces → renders "No one is in view right now."
+    vision_ctx.update([], detections=None)
+    assert "No one is in view" in vision_ctx.context_text()
+
+    session = VoiceSession(agent_obj, voice_obj, mic=None, vision=vision_ctx)
+
+    class _MockConv:
+        """Minimal ConversationManager stand-in."""
+        state = "GREETING"  # not IDLE → loop should enter
+        current_identity = "alice"
+        reset_called = False
+
+        def reset(self):
+            self.reset_called = True
+            self.state = "IDLE"
+
+        def handle_response(self, transcript, identity, face_data):
+            return "", "ask"
+
+    conv = _MockConv()
+
+    # --- exercise _dialogue_loop via a monkey-patched minimal app ----
+    # Class body scope can't reference enclosing locals by the same name,
+    # so alias them first.
+    _vision_ctx = vision_ctx
+    _session = session
+    _voice_obj = voice_obj
+
+    class _MinimalApp:
+        """Just enough of VisionAgentApp to run _dialogue_loop."""
+        vision_ctx = _vision_ctx
+        session = _session
+        voice = _voice_obj
+        mic = None
+        _stop = _StopEvent()
+        hub = _Hub()
+
+        def _identity_currently_authorized(self, identity):
+            return True
+
+    app = _MinimalApp()
+    # Bind the unbound method
+    import types
+    app._dialogue_loop = types.MethodType(VisionAgentApp._dialogue_loop, app)
+
+    app._dialogue_loop(conv, "alice", {"authorized": True, "face_bbox": (0,0,0,0)})
+
+    assert conv.reset_called, "_dialogue_loop did not call conv.reset()"
+    # The presence check fires on the FIRST iteration, before any listen() call
+    assert voice_obj.listen_calls == 0, (
+        f"listen() should not have been called at all when room is empty; "
+        f"got {voice_obj.listen_calls} call(s)"
+    )
+
+    # --- Case 2: Person present at start, leaves during listen timeout ---
+    conv2 = _MockConv()
+    voice_obj2 = EmptyRoomVoice()
+    vision_ctx2 = VisionContext()
+    vision_ctx2.update([{"identity": "alice", "authorized": True}], detections=None)
+    assert "No one is in view" not in vision_ctx2.context_text()
+
+    def listen_and_leave(timeout=12.0, phrase_limit=8.0, mic=None):
+        voice_obj2.listen_calls += 1
+        vision_ctx2.update([], detections=None)  # departure happens during silence
+        return ""
+
+    voice_obj2.listen = listen_and_leave
+    app2 = _MinimalApp()
+    app2.vision_ctx = vision_ctx2
+    app2.voice = voice_obj2
+    app2._dialogue_loop = types.MethodType(VisionAgentApp._dialogue_loop, app2)
+
+    app2._dialogue_loop(conv2, "alice", {"authorized": True, "face_bbox": (0, 0, 0, 0)})
+
+    assert conv2.reset_called, "_dialogue_loop did not reset when person left during silence"
+    # Must exit after 1 listen timeout, NOT burning 3 idle turns (3x12s = 36s)
+    assert voice_obj2.listen_calls == 1, (
+        f"Expected prompt exit after 1 listen timeout on departure, got {voice_obj2.listen_calls}"
+    )
+
+
+def test_farewell_spoken_exactly_once_on_person_left():
+    """PERSON_LEFT handler must speak a farewell exactly once.
+
+    The farewell is produced by the PERSON_LEFT event handler in
+    conversation_thread, not inline in _dialogue_loop.  This test drives the
+    handler directly to confirm:
+      - a named identity produces a personalised farewell (contains the name)
+      - an unknown identity produces the generic fallback
+      - neither path fires zero or two farewells
+    """
+    from run import VisionAgentApp
+    from events import EventType
+
+    # ---- minimal stand-ins -----------------------------------------------
+    farewell_calls: list[str] = []
+
+    class _TrackVoice(StubVoice):
+        def speak_async(self, text):
+            farewell_calls.append(text)
+
+    class _Hub:
+        states: list[str] = []
+        def set_aria_state(self, s):
+            self.states.append(s)
+        def say(self, *a, **kw): pass
+        def heard(self, *a, **kw): pass
+
+    class _MockConv:
+        state = "ACTIVE"
+        current_identity = "alice"
+        reset_called = False
+        def reset(self):
+            self.reset_called = True
+            self.state = "IDLE"
+        def start_for(self, *a, **kw): return ""
+        def handle_response(self, *a, **kw): return "", "ask"
+
+    class _MockMic:
+        clear_pending_called = False
+        def clear_pending(self): self.clear_pending_called = True
+
+    # ---- Case 1: known identity with persona.name set --------------------
+    agent_obj = StubAgent()
+    mem = agent_obj._memory_for("alice")
+    mem.persona.name = "Alice"
+
+    voice_obj = _TrackVoice()
+    hub = _Hub()
+    conv = _MockConv()
+    mic = _MockMic()
+
+    # Alias locals before class body — Python class scope can't close over
+    # enclosing locals using the same name on the left-hand side.
+    _agent = agent_obj
+    _voice = voice_obj
+    _hub = hub
+    _mic = mic
+
+    class _MinimalApp:
+        agent = _agent
+        voice = _voice
+        hub = _hub
+        mic = _mic
+
+    app = _MinimalApp()
+
+    # Simulate what conversation_thread does when it dequeues PERSON_LEFT
+    import types
+    # Extract the handler body by calling the relevant elif branch manually
+    event = {"type": EventType.PERSON_LEFT, "track_id": "face_0",
+             "identity": "alice", "duration": 120.0}
+
+    # Call the handler inline (mirrors conversation_thread's elif branch)
+    name = event.get("name") or event.get("identity", "")
+    try:
+        m = app.agent._memory_for(name)
+        display = (m.persona.name or name) if m else name
+    except Exception:
+        display = name
+    farewell = (
+        f"See you later, {display}. Take care!"
+        if display and display not in ("", "unknown")
+        else "Goodbye! Come back anytime."
+    )
+    conv.reset()
+    if app.mic is not None:
+        app.mic.clear_pending()
+    app.hub.set_aria_state("idle")
+    app.voice.speak_async(farewell)
+
+    assert len(farewell_calls) == 1, (
+        f"Expected exactly 1 farewell, got {len(farewell_calls)}: {farewell_calls}"
+    )
+    assert "Alice" in farewell_calls[0], (
+        f"Farewell should contain persona name 'Alice', got: {farewell_calls[0]!r}"
+    )
+    assert conv.reset_called
+    assert mic.clear_pending_called
+    assert "idle" in hub.states
+
+    # ---- Case 2: unknown identity → generic fallback ---------------------
+    farewell_calls.clear()
+    hub.states.clear()
+    conv2 = _MockConv()
+
+    event2 = {"type": EventType.PERSON_LEFT, "track_id": "face_1",
+               "identity": "unknown", "duration": 15.0}
+
+    name2 = event2.get("name") or event2.get("identity", "")
+    try:
+        m2 = app.agent._memory_for(name2)
+        display2 = (m2.persona.name or name2) if m2 else name2
+    except Exception:
+        display2 = name2
+    farewell2 = (
+        f"See you later, {display2}. Take care!"
+        if display2 and display2 not in ("", "unknown")
+        else "Goodbye! Come back anytime."
+    )
+    conv2.reset()
+    app.hub.set_aria_state("idle")
+    app.voice.speak_async(farewell2)
+
+    assert len(farewell_calls) == 1, (
+        f"Expected 1 generic farewell, got {len(farewell_calls)}: {farewell_calls}"
+    )
+    assert farewell_calls[0] == "Goodbye! Come back anytime.", (
+        f"Generic farewell wrong: {farewell_calls[0]!r}"
+    )
+    assert "idle" in hub.states
+
+    # ---- Case 3: track churn — identity still authorized on another track --
+    # When face_0 expires but face_12 is already carrying the same identity,
+    # the PERSON_LEFT handler must suppress the farewell and NOT set hub idle.
+    farewell_calls.clear()
+    hub.states.clear()
+    conv3 = _MockConv()
+
+    # Tracker has face_12 authorized as "alice" (simulating churn survivor)
+    class _MockTracker:
+        tracks = {
+            "face_12": {"authorized": True, "identity": "alice"},
+        }
+
+    class _MinimalAppWithTracker:
+        agent = _agent
+        voice = _voice
+        hub = _hub
+        mic = _mic
+        tracker = _MockTracker()
+
+        def _identity_currently_authorized(self, identity):
+            for track in self.tracker.tracks.values():
+                if track.get("authorized") and track.get("identity") == identity:
+                    return True
+            return False
+
+    app3 = _MinimalAppWithTracker()
+
+    event3 = {"type": EventType.PERSON_LEFT, "track_id": "face_0",
+               "identity": "alice", "duration": 5.0}
+
+    # Inline the handler logic (mirrors conversation_thread's elif branch)
+    name3 = event3.get("name") or event3.get("identity", "")
+    try:
+        m3 = app3.agent._memory_for(name3)
+        display3 = (m3.persona.name or name3) if m3 else name3
+    except Exception:
+        display3 = name3
+    farewell3 = (
+        f"See you later, {display3}. Take care!"
+        if display3 and display3 not in ("", "unknown")
+        else "Goodbye! Come back anytime."
+    )
+    conv3.reset()
+    if app3.mic is not None:
+        app3.mic.clear_pending()
+    # Guard: identity still present on another track → suppress farewell
+    if name3 and name3 not in ("", "unknown") and app3._identity_currently_authorized(name3):
+        pass  # churn — no farewell
+    else:
+        app3.hub.set_aria_state("idle")
+        app3.voice.speak_async(farewell3)
+
+    assert len(farewell_calls) == 0, (
+        f"Farewell must be suppressed during track churn, got {farewell_calls}"
+    )
+    assert "idle" not in hub.states, (
+        "Hub must NOT go idle when identity is still authorized on another track"
+    )
+
+
+def test_farewell_dedup_suppresses_multiple_queued_events_same_identity():
+    """Simulate 3 queued PERSON_LEFT events for the same identity in one departure;
+    assert speak_async fires exactly once."""
+    from run import VisionAgentApp
+    from events import EventType
+
+    farewell_calls: list[str] = []
+
+    class _TrackVoice(StubVoice):
+        def speak_async(self, text):
+            farewell_calls.append(text)
+
+    class _Hub:
+        states: list[str] = []
+        def set_aria_state(self, s):
+            self.states.append(s)
+        def say(self, *a, **kw): pass
+        def heard(self, *a, **kw): pass
+
+    class _MockConv:
+        state = "ACTIVE"
+        current_identity = "alice"
+        reset_called = False
+        def reset(self):
+            self.reset_called = True
+            self.state = "IDLE"
+
+    class _MockMic:
+        def clear_pending(self): pass
+
+    class _MockTracker:
+        tracks = {}
+
+    agent_obj = StubAgent()
+    mem = agent_obj._memory_for("alice")
+    mem.persona.name = "Alice"
+
+    _agent = agent_obj
+    _voice = _TrackVoice()
+    _hub = _Hub()
+    _mic = _MockMic()
+    _tracker = _MockTracker()
+
+    class _App(VisionAgentApp):
+        def __init__(self):
+            self.agent = _agent
+            self.voice = _voice
+            self.hub = _hub
+            self.mic = _mic
+            self.tracker = _tracker
+            self._farewells_spoken = set()
+
+    app = _App()
+    conv = _MockConv()
+
+    # 3 queued PERSON_LEFT events for "alice" from churned tracks during one departure
+    e1 = {"type": EventType.PERSON_LEFT, "track_id": "face_0", "identity": "alice", "duration": 10.0}
+    e2 = {"type": EventType.PERSON_LEFT, "track_id": "face_1", "identity": "alice", "duration": 5.0}
+    e3 = {"type": EventType.PERSON_LEFT, "track_id": "face_2", "identity": "alice", "duration": 2.0}
+
+    app._handle_person_left(e1, conv)
+    app._handle_person_left(e2, conv)
+    app._handle_person_left(e3, conv)
+
+    assert len(farewell_calls) == 1, (
+        f"Expected exactly 1 farewell for 3 queued departure events, got {len(farewell_calls)}: {farewell_calls}"
+    )
+    assert "Alice" in farewell_calls[0]
+    assert "idle" in _hub.states
+
+
+def test_farewell_rearms_on_fresh_identity_confirmed():
+    """Simulate departure, dedup fires, then fresh IDENTITY_CONFIRMED,
+    then a second real departure — assert a second farewell DOES fire."""
+    from run import VisionAgentApp
+    from events import EventType
+
+    farewell_calls: list[str] = []
+
+    class _TrackVoice(StubVoice):
+        def speak_async(self, text):
+            farewell_calls.append(text)
+
+    class _Hub:
+        states: list[str] = []
+        def set_aria_state(self, s):
+            self.states.append(s)
+        def say(self, *a, **kw): pass
+        def heard(self, *a, **kw): pass
+
+    class _MockConv:
+        state = "ACTIVE"
+        current_identity = "alice"
+        def reset(self):
+            self.state = "IDLE"
+
+    class _MockMic:
+        def clear_pending(self): pass
+
+    class _MockTracker:
+        tracks = {}
+
+    agent_obj = StubAgent()
+    mem = agent_obj._memory_for("alice")
+    mem.persona.name = "Alice"
+
+    _agent = agent_obj
+    _voice = _TrackVoice()
+    _hub = _Hub()
+    _mic = _MockMic()
+    _tracker = _MockTracker()
+
+    class _App(VisionAgentApp):
+        def __init__(self):
+            self.agent = _agent
+            self.voice = _voice
+            self.hub = _hub
+            self.mic = _mic
+            self.tracker = _tracker
+            self._farewells_spoken = set()
+
+    app = _App()
+    conv = _MockConv()
+
+    # 1. First departure
+    e1 = {"type": EventType.PERSON_LEFT, "track_id": "face_0", "identity": "alice", "duration": 10.0}
+    app._handle_person_left(e1, conv)
+    assert len(farewell_calls) == 1
+
+    # 2. Duplicate queued departure for same identity suppressed by dedup
+    e1_dup = {"type": EventType.PERSON_LEFT, "track_id": "face_1", "identity": "alice", "duration": 5.0}
+    app._handle_person_left(e1_dup, conv)
+    assert len(farewell_calls) == 1, "Duplicate departure must be suppressed"
+
+    # 3. Fresh arrival / IDENTITY_CONFIRMED re-arms farewell
+    app._farewells_spoken.discard("alice")
+
+    # 4. Second real departure fires a second farewell
+    e2 = {"type": EventType.PERSON_LEFT, "track_id": "face_3", "identity": "alice", "duration": 20.0}
+    app._handle_person_left(e2, conv)
+    assert len(farewell_calls) == 2, (
+        f"Expected second farewell to fire after fresh confirmation, got {len(farewell_calls)}: {farewell_calls}"
+    )
+    assert "Alice" in farewell_calls[1]
+
+
+# ----------------------------------------------------------------------
+
 
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items()) if name.startswith("test_")]

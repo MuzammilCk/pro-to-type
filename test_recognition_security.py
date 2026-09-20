@@ -608,6 +608,198 @@ def test_assignment_is_one_to_one():
 
 
 # ----------------------------------------------------------------------
+# Regression: moderate head movement / rotation retains track & no spurious left
+# ----------------------------------------------------------------------
+
+def test_moderate_head_movement_retains_track_no_spurious_left():
+    """Moderate head movement/rotation between frames previously exceeded
+    cost (1.07 > 1.0) and IoU (0.11 < 0.30) thresholds, causing track swaps
+    and spurious PERSON_LEFT events. Under the scoped interim fix, track ID
+    is retained and PresenceManager emits no PERSON_LEFT."""
+    from presence import PresenceManager
+    from tracker import FaceTracker
+    from events import EventType
+
+    class MovementEngine(FakeFaceEngine):
+        def __init__(self, boxes, identify_verdicts):
+            super().__init__()
+            self.boxes = list(boxes)
+            self.verdicts = list(identify_verdicts)
+
+        def detect(self, frame):
+            b = self.boxes.pop(0) if self.boxes else [(220, 105, 140, 140)]
+            if not b:
+                return np.empty((0, 0))
+            rows = []
+            for (x, y, w, h) in b:
+                cx, cy = x + w // 2, y + h // 2
+                rows.append([float(x), float(y), float(w), float(h),
+                             float(cx - 10), float(cy - 10), float(cx + 10), float(cy - 10),
+                             float(cx), float(cy), float(cx - 8), float(cy + 12),
+                             float(cx + 8), float(cy + 12), 0.9])
+            return np.array(rows)
+
+        def identify(self, frame, face):
+            if self.verdicts:
+                return self.verdicts.pop(0)
+            return make_verdict("alice", 0.75, True)
+
+    # 150x150 face shifted by 115px (IoU ~ 0.11, dist 115px)
+    script_boxes = [
+        [(100, 100, 150, 150)],  # Frame 1: initial face
+        [(215, 105, 140, 140)],  # Frame 2: moderate shift (previously exceeded cost & IoU)
+        [(220, 105, 140, 140)],  # Frame 3: stable at new position
+        [(220, 105, 140, 140)],  # Frame 4: stable
+    ]
+    # During head turn, 2 frames miss recognition before turning back
+    verdicts = [
+        make_verdict("alice", 0.80, True),                                  # Frame 1: pos 1
+        make_verdict("alice", 0.80, True),                                  # pos 2 -> AUTHORIZED
+        make_verdict("", 0.20, False, reason="threshold_rejection"),        # Frame 2: turn miss 1
+        make_verdict("", 0.22, False, reason="threshold_rejection"),        # Frame 3: turn miss 2 (40ms later)
+        make_verdict("alice", 0.78, True),                                  # Frame 4: head back -> match
+    ]
+    eng = MovementEngine(script_boxes, verdicts)
+    tr = FaceTracker(eng, revoke_window_sec=0.8)
+    event_queue = queue_mod.Queue()
+    pm = PresenceManager(event_queue)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    t0 = 1000.0
+    for i in range(4):
+        now = t0 + i * 0.04  # 40ms intervals (~124 FPS verification cadence)
+        results = tr.update(frame, downscale_factor=1.0, now=now)
+        tr.recognize_faces(frame, now=now)
+        # Re-verify during the initial frames to drive the state machine
+        if i == 0:
+            tr.tracks["face_0"]["needs_recognition"] = True
+            tr.recognize_faces(frame, now=now)
+        results = tr.update_results()
+        pm.update(results, now=now)
+
+    # 1. Assert exactly 1 track exists and its ID was retained as face_0
+    assert len(tr.tracks) == 1, f"Expected 1 track, got {list(tr.tracks.keys())}"
+    assert "face_0" in tr.tracks, f"Track ID face_0 was lost! Active: {list(tr.tracks.keys())}"
+    assert tr.tracks["face_0"]["identity"] == "alice"
+    assert tr.tracks["face_0"]["authorized"] is True, (
+        f"Authorization dropped prematurely during head turn: {tr.tracks['face_0']['state']}"
+    )
+
+    # 2. Advance time past 2.5s and update presence with ongoing face to verify no delayed PERSON_LEFT fires
+    for i in range(4, 25):
+        now = t0 + i * 0.1  # reaches t0 + 2.4s
+        results = tr.update(frame, downscale_factor=1.0, now=now)
+        tr.cleanup_left_faces(now=now)
+        pm.update(results, now=now)
+
+    events = []
+    while not event_queue.empty():
+        events.append(event_queue.get_nowait())
+
+    left_events = [e for e in events if e.get("type") in ("person_left", EventType.PERSON_LEFT)]
+    assert left_events == [], f"Spurious PERSON_LEFT fired: {left_events}"
+
+    # Verify PERSON_ENTERED fired exactly once for face_0
+    entered_events = [e for e in events if e.get("type") in ("person_entered", EventType.PERSON_ENTERED)]
+    assert len(entered_events) == 1
+    assert entered_events[0].get("track_id") == "face_0"
+
+
+# ----------------------------------------------------------------------
+# Sustained loss: recognition absent for > ARIA_REVOKE_WINDOW_SEC revokes
+# ----------------------------------------------------------------------
+
+def test_sustained_loss_revokes_authorization():
+    """Sustained absence or non-matching face lasting longer than
+    ARIA_REVOKE_WINDOW_SEC must revoke authorization — asserts that temporal
+    grace expires and identity is dropped on real or mocked time advancement."""
+    from tracker import FaceTracker
+
+    tr = _tracker_with_track(authorized=True, identity="alice")
+    tr.revoke_window_sec = 0.8
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+    t0 = 1000.0
+    # Miss 1 at t0: starts the miss window; stays authorized provisionally
+    tr.face_engine.script = [make_verdict("", 0.15, False, "threshold_rejection")]
+    tr.recognize_faces(frame, now=t0)
+    assert tr.tracks["face_0"]["authorized"] is True
+    assert tr.tracks["face_0"]["identity"] == "alice"
+
+    # Miss 2 at t0 + 400ms (< 800ms window): streak=2, but within grace period
+    tr.tracks["face_0"]["needs_recognition"] = True
+    tr.face_engine.script = [make_verdict("", 0.15, False, "threshold_rejection")]
+    tr.recognize_faces(frame, now=t0 + 0.4)
+    assert tr.tracks["face_0"]["authorized"] is True, "premature revocation before window elapsed"
+    assert tr.tracks["face_0"]["identity"] == "alice"
+
+    # Miss 3 at t0 + 1000ms (> 800ms window): grace period expired -> REVOKING
+    tr.tracks["face_0"]["needs_recognition"] = True
+    tr.face_engine.script = [make_verdict("", 0.15, False, "threshold_rejection")]
+    tr.recognize_faces(frame, now=t0 + 1.0)
+    track = tr.tracks["face_0"]
+    assert track["authorized"] is False, "sustained loss failed to revoke authorization"
+    assert track["state"] == "REVOKING"
+    assert track["identity"] == "unknown"
+
+
+# ----------------------------------------------------------------------
+# Overlapping faces: 8-20% IoU must NOT merge into one track
+# ----------------------------------------------------------------------
+
+def test_overlapping_faces_not_merged_into_one_track():
+    """Two different people with bounding boxes overlapping in the 8-20% range
+    must remain separate tracks throughout tracking, and must NOT merge even
+    if one detection temporarily drops for a frame."""
+    from tracker import FaceTracker
+
+    # Face A: (50, 100, 100, 100); Face B: (124, 100, 100, 100)
+    # Intersection: 26x100 = 2600. Union: 17400. IoU = 14.94% (in 8-20% range).
+    row_a = [50.0, 100.0, 100.0, 100.0, 70, 120, 110, 120, 90, 140, 80, 160, 100, 160, 0.9]
+    row_b = [124.0, 100.0, 100.0, 100.0, 144, 120, 184, 120, 164, 140, 154, 160, 174, 160, 0.9]
+
+    script_detections = [
+        [row_a, row_b],   # Frame 1: both present
+        [row_a, row_b],   # Frame 2: both present
+        [row_b],          # Frame 3: Alice flickers! Bob present.
+        [row_a, row_b],   # Frame 4: Alice re-detected!
+        [row_a, row_b],   # Frame 5: both stable
+    ]
+
+    class OverlappingEngine(FakeFaceEngine):
+        def __init__(self, detections):
+            super().__init__()
+            self.frames = list(detections)
+
+        def detect(self, frame):
+            rows = self.frames.pop(0) if self.frames else []
+            return np.array(rows) if rows else np.empty((0, 0))
+
+        def identify(self, frame, face):
+            if face[0] < 100:
+                return make_verdict("alice", 0.80, True)
+            return make_verdict("bob", 0.80, True)
+
+    eng = OverlappingEngine(script_detections)
+    tr = FaceTracker(eng)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    t0 = 1000.0
+    for i in range(5):
+        now = t0 + i * 0.05
+        tr.update(frame, downscale_factor=1.0, now=now)
+        tr.recognize_faces(frame, now=now)
+
+    # Both faces must remain distinct tracks
+    assert len(tr.tracks) == 2, f"Overlapping faces collapsed into {len(tr.tracks)} track(s): {list(tr.tracks.keys())}"
+    assert "face_0" in tr.tracks and "face_1" in tr.tracks, (
+        f"Track IDs swapped or merged: {list(tr.tracks.keys())}"
+    )
+    assert tr.tracks["face_0"]["identity"] == "alice"
+    assert tr.tracks["face_1"]["identity"] == "bob"
+
+
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items())

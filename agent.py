@@ -5,6 +5,7 @@ import asyncio
 import threading
 import base64
 from typing import Iterator
+from dataclasses import dataclass, field
 
 try:
     import httpx
@@ -78,10 +79,25 @@ class VisionAgent:
                 return client, f"openrouter/{client.model}"
         return LocalFallbackLLM(), "local-fallback"
 
-    def _memory_for(self, identity: str) -> PersonMemory:
+    def _memory_for(self, identity: str, face_data: dict | None = None) -> PersonMemory:
+        if identity == "unknown":
+            track_id = (face_data or {}).get("track_id") or (face_data or {}).get("visitor_id")
+            key = f"unknown_{track_id}" if track_id else "unknown"
+            if key not in self.memory:
+                self.memory[key] = PersonMemory(identity="unknown")
+            return self.memory[key]
         if identity not in self.memory:
             self.memory[identity] = PersonMemory.load(identity)
         return self.memory[identity]
+
+    def clear_stranger_memory(self, track_id: str | None = None):
+        """Clear session-scoped memory for an unknown visitor (e.g. when track ends)."""
+        if track_id:
+            self.memory.pop(f"unknown_{track_id}", None)
+        else:
+            to_del = [k for k in self.memory if k == "unknown" or k.startswith("unknown_")]
+            for k in to_del:
+                del self.memory[k]
 
     def _build_context(self, identity: str, face_data: dict,
                        mem: PersonMemory, user_input: str | None) -> list[dict]:
@@ -132,7 +148,7 @@ class VisionAgent:
         Yields (token, action_so_far) tuples. Action stabilizes when
         the full response is seen.
         """
-        mem = self._memory_for(identity)
+        mem = self._memory_for(identity, face_data)
         if user_input:
             mem.add_interaction("user", user_input)
 
@@ -159,7 +175,8 @@ class VisionAgent:
 
         if full_response.strip():
             mem.add_interaction("assistant", full_response.strip())
-        mem.save()
+        if mem.is_dirty():
+            mem.save()
 
     def think(self, identity: str, face_data: dict,
               user_input: str | None = None) -> tuple[str, str]:
@@ -169,7 +186,7 @@ class VisionAgent:
         LLM path never persisted anything, so recognized visitors were
         forgotten between runs.
         """
-        mem = self._memory_for(identity)
+        mem = self._memory_for(identity, face_data)
         if user_input:
             mem.add_interaction("user", user_input)
 
@@ -182,7 +199,8 @@ class VisionAgent:
             action = self._decide(identity, user_input, response)
 
         mem.add_interaction("assistant", response)
-        mem.save()
+        if mem.is_dirty():
+            mem.save()
         return response, action
 
     def _fallback(self, identity: str, user_input: str | None, mem: PersonMemory) -> str:
@@ -280,6 +298,21 @@ def _split_sentences(text: str) -> tuple[list[str], str]:
     return sentences, text[start:]
 
 
+@dataclass
+class WorldState:
+    """Structured representation of what ARIA observes in the physical world.
+
+    Seed for Phase 2/3: separates raw perception state (people, objects, events)
+    from rendered LLM prompts and conversational dialogue state.
+    """
+    known_people: list[str] = field(default_factory=list)
+    unrecognized_count: int = 0
+    background_people_count: int = 0
+    objects: list[str] = field(default_factory=list)
+    recent_events: list[str] = field(default_factory=list)
+    last_known_name: str | None = None
+
+
 class VisionContext:
     """Compact "what ARIA sees" summary, refreshed each vision frame.
 
@@ -290,10 +323,58 @@ class VisionContext:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.summary = "No vision input right now."
-        self.recent_events: list[str] = []
-        self.last_known_name: str | None = None
-        self.objects: list[str] = []  # non-person object labels seen by OpenCV
+        self.world_state = WorldState()
+        self._has_updated = False
+        self._custom_summary: str | None = None
+
+    @property
+    def last_known_name(self) -> str | None:
+        return self.world_state.last_known_name
+
+    @last_known_name.setter
+    def last_known_name(self, value: str | None):
+        self.world_state.last_known_name = value
+
+    @property
+    def objects(self) -> list[str]:
+        return self.world_state.objects
+
+    @objects.setter
+    def objects(self, value: list[str]):
+        self.world_state.objects = value
+
+    @property
+    def recent_events(self) -> list[str]:
+        return self.world_state.recent_events
+
+    @recent_events.setter
+    def recent_events(self, value: list[str]):
+        self.world_state.recent_events = value
+
+    @property
+    def summary(self) -> str:
+        if self._custom_summary is not None:
+            return self._custom_summary
+        if not self._has_updated:
+            return "No vision input right now."
+        return self._render_summary()
+
+    @summary.setter
+    def summary(self, value: str):
+        self._custom_summary = value
+
+    def _render_summary(self) -> str:
+        ws = self.world_state
+        if not ws.known_people and not ws.unrecognized_count and not ws.background_people_count:
+            return "No one is in view right now."
+        parts = []
+        if ws.known_people:
+            parts.append("Recognized: " + ", ".join(ws.known_people) + ".")
+        if ws.unrecognized_count:
+            parts.append(f"{ws.unrecognized_count} unrecognized visitor(s) here.")
+        if ws.background_people_count > 0:
+            parts.append(f"{ws.background_people_count} other person(s) in the background.")
+        return " ".join(parts)
 
     def update(self, face_results, detections=None):
         known = [fr.get("identity") for fr in face_results
@@ -308,33 +389,27 @@ class VisionContext:
             label = getattr(d, "label", "")
             if label and label != "person" and label not in objects:
                 objects.append(label)
+        extra = people - len(face_results)
         with self.lock:
-            self.objects = objects[:5]
+            self._has_updated = True
+            self._custom_summary = None
+            self.world_state.known_people = known
+            self.world_state.unrecognized_count = strangers
+            self.world_state.background_people_count = max(0, extra)
+            self.world_state.objects = objects[:5]
             # Phase 8: the "known name" is CURRENT-VIEW state only. When no
             # authorized face is visible (revoked, left, occluded), the name
             # is cleared — a stale identity must never flow into the
             # conversation brain.
             if known:
-                self.last_known_name = known[0]
+                self.world_state.last_known_name = known[0]
             else:
-                self.last_known_name = None
-            if not face_results and not people:
-                self.summary = "No one is in view right now."
-            else:
-                parts = []
-                if known:
-                    parts.append("Recognized: " + ", ".join(known) + ".")
-                if strangers:
-                    parts.append(f"{strangers} unrecognized visitor(s) here.")
-                extra = people - len(face_results)
-                if extra > 0:
-                    parts.append(f"{extra} other person(s) in the background.")
-                self.summary = " ".join(parts)
+                self.world_state.last_known_name = None
 
     def add_event(self, description: str):
         with self.lock:
-            self.recent_events.append(description)
-            self.recent_events = self.recent_events[-5:]
+            self.world_state.recent_events.append(description)
+            self.world_state.recent_events = self.world_state.recent_events[-5:]
 
     def clear_identity(self, name: str | None = None):
         """Drop remembered identity (Phase 8 revocation path).
@@ -343,14 +418,15 @@ class VisionContext:
         Without: drop any remembered name.
         """
         with self.lock:
-            if name is None or self.last_known_name == name:
-                self.last_known_name = None
+            if name is None or self.world_state.last_known_name == name:
+                self.world_state.last_known_name = None
 
     def context_text(self) -> str:
         with self.lock:
-            ev = (" Recent: " + " | ".join(self.recent_events[-3:])) if self.recent_events else ""
-            obj = (" Nearby objects: " + ", ".join(self.objects) + ".") if self.objects else ""
-            return self.summary + obj + ev
+            summary = self.summary
+            ev = (" Recent: " + " | ".join(self.world_state.recent_events[-3:])) if self.world_state.recent_events else ""
+            obj = (" Nearby objects: " + ", ".join(self.world_state.objects) + ".") if self.world_state.objects else ""
+            return summary + obj + ev
 
 
 class VoiceBrain:
@@ -477,7 +553,7 @@ class VoiceSession:
     """
 
     NUDGE_MINUTES = 1.5   # idle minutes before a conversational nudge
-    MAX_NUDGES = 2        # max nudges before ARIA stops poking the human
+    MAX_NUDGES = 1        # max nudges before ARIA stops poking the human (one-shot per idle stretch)
     CACHE_TTL = 60.0      # backend answers cached this long per question
 
     def __init__(self, agent: "VisionAgent", voice, mic=None, vision: VisionContext | None = None):

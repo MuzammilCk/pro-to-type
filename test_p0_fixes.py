@@ -14,6 +14,7 @@ import threading
 import time
 import queue as queue_mod
 import os
+from events import EventType
 
 import numpy as np
 
@@ -458,7 +459,7 @@ def test_b9_identity_cooldown_suppresses_reentry_greeting():
     events = []
     while not q.empty():
         events.append(q.get_nowait()["type"])
-    assert "person_recognized" not in events, (
+    assert EventType.IDENTITY_CONFIRMED not in events, (
         "identity-level cooldown failed: re-entering known person re-greeted"
     )
 
@@ -483,7 +484,7 @@ def test_b9_identity_cooldown_expires():
     events = []
     while not q.empty():
         events.append(q.get_nowait()["type"])
-    assert "person_recognized" in events, "cooldown never expired for known person"
+    assert EventType.IDENTITY_CONFIRMED in events, "cooldown never expired for known person"
 
 
 def test_presence_unknown_reentry_still_greeted():
@@ -762,9 +763,10 @@ def test_b11_ghost_dropped_when_twin_is_matched_track():
 
 
 def test_b12_anon_persona_roundtrip():
-    """PersonaGraph.save(identity="unknown") writes anon_<date>.json; load()
-    must read it back the same day (facts learned about a stranger survive).
-    Backs up/restores any real anon file so the user's data is untouched."""
+    """Phase 1: unknown identity personas are session-scoped and non-persistent.
+    save(identity="unknown") does NOT write anon_<date>.json; load("unknown")
+    always returns a fresh unpersisted instance.
+    """
     import context_memory
 
     today = context_memory.datetime.datetime.now().strftime("%Y%m%d")
@@ -773,30 +775,18 @@ def test_b12_anon_persona_roundtrip():
     if os.path.exists(anon_path):
         with open(anon_path) as f:
             backup = f.read()
+        os.remove(anon_path)
     try:
-        # also guard against a stale unknown.json shadowing the anon bucket
-        unknown_path = os.path.join(context_memory.PERSONA_DIR, "unknown.json")
-        unknown_backup = None
-        if os.path.exists(unknown_path):
-            with open(unknown_path) as f:
-                unknown_backup = f.read()
-        if os.path.exists(unknown_path):
-            os.remove(unknown_path)
-
         pg = context_memory.PersonaGraph("unknown")
         pg.traits = ["wearing glasses", "mentioned printer repair"]
         pg.purpose = "fixing the coffee machine"
-        pg.save()
-        assert os.path.exists(anon_path), "save(unknown) should write anon_<date>.json"
+        saved = pg.save()
+        assert saved is False, "save(unknown) should refuse to persist"
+        assert not os.path.exists(anon_path), "save(unknown) should NOT write anon_<date>.json"
 
         loaded = context_memory.PersonaGraph.load("unknown")
-        assert loaded.traits == ["wearing glasses", "mentioned printer repair"], (
-            "anon persona did not survive save->load — memory bug is back")
-        assert loaded.purpose == "fixing the coffee machine"
-
-        if unknown_backup is not None:
-            with open(unknown_path, "w") as f:
-                f.write(unknown_backup)
+        assert loaded.traits == [], "unknown persona should always load fresh, not from disk"
+        assert loaded.purpose == ""
     finally:
         if backup is not None:
             with open(anon_path, "w") as f:

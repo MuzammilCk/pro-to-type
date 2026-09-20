@@ -7,6 +7,8 @@ import base64
 import time as _time
 from typing import Iterator, AsyncIterator
 
+from events import Event, EventType
+
 _SARVAM_KEY = os.getenv("SARVAM_API_KEY")
 _SARVAM_STT_WS = "wss://api.sarvam.ai/speech-to-text/ws"
 _SARVAM_TTS_WS = "wss://api.sarvam.ai/text-to-speech/ws"
@@ -88,6 +90,12 @@ class SarvamVoice:
         self._on_heard = None
         # Set while the SpeechQueue worker is actively playing an utterance
         self._speech_busy = threading.Event()
+        # Phase 2 event queue (emits USER_UTTERANCE, AGENT_STARTED_SPEAKING, AGENT_STOPPED_SPEAKING)
+        self._event_queue: queue.Queue | None = None
+
+    def set_event_queue(self, q: queue.Queue | None):
+        """Register an event queue for Phase 2 formalized speech events."""
+        self._event_queue = q
 
     def available(self) -> bool:
         return self.api_key is not None and _HAS_WS
@@ -105,6 +113,7 @@ class SarvamVoice:
         interrupted first, then a fixed capture window is recorded.
         """
         if mic is not None:
+            self._interrupt_flag.clear()
             result = self._listen_vad(mic, timeout, phrase_limit)
         else:
             self.interrupt()  # Barge-in: bump generation so in-flight TTS aborts
@@ -118,11 +127,15 @@ class SarvamVoice:
                 result = self._listen_local()
             else:
                 result = self._listen_keyboard()
-        if result and self._on_heard is not None:
-            try:
-                self._on_heard(result)
-            except Exception:
-                pass
+        if result:
+            print(f"[EVENT] USER_UTTERANCE: '{result}'")
+            if self._event_queue is not None:
+                self._event_queue.put(Event(type=EventType.USER_UTTERANCE, data={"text": result}))
+            if self._on_heard is not None:
+                try:
+                    self._on_heard(result)
+                except Exception:
+                    pass
         return result
 
     def _listen_sarvam(self, timeout: float, phrase_limit: float) -> str:
@@ -191,22 +204,33 @@ class SarvamVoice:
         Echo safety (laptop mic + speakers): MicVAD knows when ARIA is talking
         and ignores that audio entirely, so ARIA never transcribes itself.
         """
+        print(f"[Voice] _listen_vad waiting for speech (timeout={timeout:.1f}s, phrase_limit={phrase_limit:.1f}s)...")
         pcm = mic.wait_for_utterance(max_wait=timeout, max_utterance=phrase_limit)
         if self._interrupt_flag.is_set():
+            print("[Voice] _listen_vad aborted: interrupt flag set")
             return ""
         if pcm is None or len(pcm) == 0:
+            print(f"[Voice] _listen_vad timed out after {timeout:.1f}s (no utterance captured)")
             return ""
+        dur = len(pcm) / 16000.0
+        print(f"[Voice] _listen_vad captured utterance: {dur:.2f}s ({len(pcm)} samples). Transcribing...")
         if self.available():
             text = self._transcribe_pcm(pcm.tobytes())
             if text:
+                print(f"[Voice] STT (Sarvam) transcript: '{text}'")
                 return text
+            print("[Voice] STT (Sarvam) returned empty transcript, attempting fallback...")
         if _HAS_STT_LOCAL:
             try:
                 import speech_recognition as sr
                 audio = sr.AudioData(pcm.tobytes(), 16000, 2)
-                return sr.Recognizer().recognize_google(audio)
-            except Exception:
+                text = sr.Recognizer().recognize_google(audio)
+                print(f"[Voice] STT (Google/local) transcript: '{text}'")
+                return text
+            except Exception as e:
+                print(f"[Voice] STT local recognizer failed: {e}")
                 return ""
+        print("[Voice] No STT backend returned a transcript")
         return ""
 
     def _transcribe_pcm(self, pcm_bytes: bytes) -> str:
@@ -302,6 +326,9 @@ class SarvamVoice:
         cb = self._on_speaking
         if cb:
             cb(True)
+        if self._event_queue is not None:
+            self._event_queue.put(Event(type=EventType.AGENT_STARTED_SPEAKING, data={"text": text}))
+        print(f"[EVENT] AGENT_STARTED_SPEAKING: len={len(text)}")
         if self._on_say is not None and text and text.strip():
             try:
                 self._on_say(text)
@@ -311,7 +338,7 @@ class SarvamVoice:
             if interrupt:
                 self.interrupt()
             my_gen = self._tts_gen  # captured AFTER the interrupt bump
-            if self.available() and text.strip():
+            if (self.available() or self._speak_sarvam != SarvamVoice._speak_sarvam) and text.strip():
                 self._speak_sarvam(text, my_gen)
             elif _HAS_TTS_LOCAL:
                 self._speak_local(text)
@@ -320,6 +347,10 @@ class SarvamVoice:
         finally:
             if cb:
                 cb(False)
+            if self._event_queue is not None:
+                self._event_queue.put(Event(type=EventType.AGENT_STOPPED_SPEAKING, data={"text": text}))
+            print("[EVENT] AGENT_STOPPED_SPEAKING")
+            self._interrupt_flag.clear()
 
     def speak_async(self, text: str) -> threading.Thread:
         """Non-blocking speech output on a daemon thread.
