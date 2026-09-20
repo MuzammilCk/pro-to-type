@@ -1004,6 +1004,99 @@ def test_farewell_rearms_on_fresh_identity_confirmed():
 
 
 # ----------------------------------------------------------------------
+# Presence: identity-level emit-time cooldown (race fix)
+# ----------------------------------------------------------------------
+
+def test_identity_confirmed_emits_only_once_for_concurrent_phantom_tracks():
+    """Two phantom tracks authorize to the same identity in rapid succession,
+    before mark_greeted() is ever called on the dispatch thread.
+    Only ONE IDENTITY_CONFIRMED must reach the queue (the second is suppressed
+    by the emit-time write to _identity_greeted added in the race fix).
+    """
+    import queue as qmodule
+    from presence import PresenceManager, TrackState
+
+    eq = qmodule.Queue()
+    pm = PresenceManager(eq)
+    now = 1_000_000.0
+
+    fr_a = {"track_id": "face_A", "identity": "MuzammilCK", "authorized": True,
+            "distance": 0.70, "face_bbox": (0, 0, 0, 0), "quality": 0.65}
+    pm.tracks["face_A"] = TrackState(
+        track_id="face_A", identity="unknown", authorized=False,
+        first_seen=now, last_seen=now)
+    pm._emit_recognized("face_A", fr_a)  # should emit AND write cooldown
+
+    events_first = []
+    while not eq.empty():
+        events_first.append(eq.get_nowait())
+
+    confirmed_first = [e for e in events_first if
+                       getattr(e.type, "name", str(e.type)) == "IDENTITY_CONFIRMED"]
+    assert len(confirmed_first) == 1, (
+        f"Expected 1 IDENTITY_CONFIRMED from face_A, got {len(confirmed_first)}"
+    )
+
+    # mark_greeted has NOT been called yet — simulating dispatch thread lag.
+    fr_b = {"track_id": "face_B", "identity": "MuzammilCK", "authorized": True,
+            "distance": 0.68, "face_bbox": (0, 0, 0, 0), "quality": 0.63}
+    pm.tracks["face_B"] = TrackState(
+        track_id="face_B", identity="unknown", authorized=False,
+        first_seen=now, last_seen=now)
+    pm._emit_recognized("face_B", fr_b)  # must be suppressed
+
+    events_second = []
+    while not eq.empty():
+        events_second.append(eq.get_nowait())
+
+    second_confirmed = [e for e in events_second if
+                        getattr(e.type, "name", str(e.type)) == "IDENTITY_CONFIRMED"]
+    assert len(second_confirmed) == 0, (
+        f"Expected 0 IDENTITY_CONFIRMED from face_B (race suppression), "
+        f"got {len(second_confirmed)}"
+    )
+
+
+def test_should_greet_identity_level_cooldown_gates_named_phantom():
+    """should_greet() must block a phantom track carrying a recently-greeted
+    named identity, and return True again after the cooldown expires.
+    For unknown-identity tracks, only the track-level cooldown applies.
+    """
+    import queue as qmodule
+    import time as _time
+    from presence import PresenceManager, TrackState
+
+    eq = qmodule.Queue()
+    pm = PresenceManager(eq)
+    now = _time.time()  # must match the real clock that should_greet() uses
+
+    # Inject identity-level cooldown directly (simulates emit-time write)
+    pm._identity_greeted["MuzammilCK"] = now  # recorded "just now"
+
+    # Phantom track carrying the same identity — must be blocked
+    pm.tracks["face_3"] = TrackState(
+        track_id="face_3", identity="MuzammilCK", authorized=True,
+        first_seen=now, last_seen=now, greeted=False,
+    )
+    assert not pm.should_greet("face_3"), (
+        "face_3 carries MuzammilCK greeted within cooldown; should_greet must return False"
+    )
+
+    # Unknown phantom — identity-level cooldown does not apply to "unknown"
+    pm.tracks["face_4"] = TrackState(
+        track_id="face_4", identity="unknown", authorized=False,
+        first_seen=now, last_seen=now, greeted=False,
+    )
+    assert pm.should_greet("face_4"), (
+        "face_4 is a new unknown track; identity cooldown must not block it"
+    )
+
+    # After cooldown expires, named phantom is allowed through again
+    pm._identity_greeted["MuzammilCK"] = now - pm.GREETING_COOLDOWN - 1.0
+    assert pm.should_greet("face_3"), (
+        "After cooldown elapsed, should_greet must return True for face_3"
+    )
+
 
 
 if __name__ == "__main__":

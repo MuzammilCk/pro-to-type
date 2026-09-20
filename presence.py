@@ -128,12 +128,25 @@ class PresenceManager:
                 self._identity_greeted[track.identity] = ts
 
     def should_greet(self, track_id: str) -> bool:
-        """Check if this track should be greeted (haven't greeted recently)."""
+        """Check if this track should be greeted (haven't greeted recently).
+
+        Checks both track-level and identity-level cooldowns. An unknown
+        track that just churned off a recently-greeted track should NOT
+        trigger a second greeting.
+        """
         if track_id not in self.tracks:
             return False
         track = self.tracks[track_id]
-        if track.greeted:
-            return time.time() - track.greeting_time > self.GREETING_COOLDOWN
+        now = time.time()
+        # Track-level cooldown
+        if track.greeted and now - track.greeting_time <= self.GREETING_COOLDOWN:
+            return False
+        # Identity-level cooldown (catches churn: same person, new track ID)
+        # Only applicable if the track currently carries a known identity.
+        if track.identity and track.identity != "unknown":
+            last = self._identity_greeted.get(track.identity)
+            if last is not None and now - last <= self.GREETING_COOLDOWN:
+                return False
         return True
 
     def _emit(self, event_type: EventType | str, track_id: str, data: dict):
@@ -160,6 +173,12 @@ class PresenceManager:
                     track.greeted = True
                     track.greeting_time = last
                 return
+            # Write the cooldown timestamp NOW, at emission time, not later
+            # via mark_greeted(). mark_greeted() is called on the dispatch
+            # thread which may lag behind this vision-thread call by seconds
+            # — long enough for a second phantom track to slip through the
+            # same cooldown check before the first event is even dequeued.
+            self._identity_greeted[name] = now
         if track:
             track.greeted = False
         self._emit(EventType.IDENTITY_CONFIRMED, track_id, {

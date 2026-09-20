@@ -453,6 +453,7 @@ class VisionAgentApp:
                 # B1 fix: the greeting is built once and spoken once by the
                 # caller (start_for returns text; playback happens here).
                 prev = event.get("previous_identity")
+                track_id = event.get("track_id", "")
 
                 # Phase 8 — revocation propagation. When the tracker revokes
                 # an identity with a live conversation, the conversation MUST
@@ -470,12 +471,22 @@ class VisionAgentApp:
                     self._speak("Hold on — I've lost track of who you are. "
                                 "Let me take a fresh look.")
 
+                # Gate: skip the greeting entirely for phantom churn tracks.
+                # should_greet() checks both the track-level cooldown AND the
+                # identity-level cooldown — so a phantom track that spawned
+                # right after another unknown was just greeted will be
+                # suppressed without entering _dialogue_loop at all.
+                if not self.presence.should_greet(track_id):
+                    print(f"[Presence] Skipping duplicate greeting for {track_id!r} "
+                          "(already greeted recently)")
+                    continue
+
                 face_data = {
                     "authorized": False,
                     "face_bbox": event.get("face_bbox", (0, 0, 0, 0)),
                     "score": event.get("score", 0.0),
                 }
-                self.presence.mark_greeted(event.get("track_id", ""))
+                self.presence.mark_greeted(track_id)
 
                 if self.vision_ctx is not None:
                     self.vision_ctx.add_event("A new visitor arrived and is being scanned.")
@@ -562,6 +573,7 @@ class VisionAgentApp:
             print(f"[Security] '{identity}' is no longer authorized — "
                   "closing authenticated dialogue.")
             conv.reset()
+            self.hub.set_aria_state("idle")
             return
 
         idle_turns = 0
