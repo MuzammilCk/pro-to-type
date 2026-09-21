@@ -21,13 +21,26 @@ class ToolResult:
     success: bool
     output: Any = None
     error: str | None = None
+    tool_call_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "tool": self.tool,
             "success": self.success,
             "output": self.output,
             "error": self.error,
+        }
+        if self.tool_call_id:
+            d["tool_call_id"] = self.tool_call_id
+        return d
+
+    def to_message(self) -> dict[str, Any]:
+        """Format as a standard OpenAI tool response message."""
+        content_val = json.dumps(self.output) if self.output is not None else json.dumps({"error": self.error})
+        return {
+            "role": "tool",
+            "tool_call_id": self.tool_call_id or self.tool,
+            "content": content_val,
         }
 
 
@@ -35,6 +48,7 @@ class ToolResult:
 # Tool Schemas / Declarations
 # ----------------------------------------------------------------------
 
+# Preserved base schemas (Phase 6 exact four)
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "memory.search": {
         "name": "memory.search",
@@ -83,6 +97,105 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+# Active OpenCV 5 Micro-Inspection Tool Schemas (Phase 10)
+VISION_INSPECTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "vision.crop_and_enhance": {
+        "name": "vision.crop_and_enhance",
+        "description": "Extract and enhance a sub-region (ROI) from the live high-resolution camera frame buffer.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "[x, y, w, h] coordinates to crop from the live frame.",
+                },
+                "enhance": {
+                    "type": "boolean",
+                    "description": "Whether to apply CLAHE contrast enhancement.",
+                },
+            },
+            "required": ["bbox"],
+        },
+    },
+    "vision.inspect_color_hsv": {
+        "name": "vision.inspect_color_hsv",
+        "description": "Segment and measure a specific color wavelength (HSV) within an ROI to verify LEDs, wiring, or badges.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "[x, y, w, h] coordinates to inspect.",
+                },
+                "lower_hsv": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Lower HSV boundary [H (0-179), S (0-255), V (0-255)].",
+                },
+                "upper_hsv": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Upper HSV boundary [H (0-179), S (0-255), V (0-255)].",
+                },
+            },
+            "required": ["bbox", "lower_hsv", "upper_hsv"],
+        },
+    },
+    "vision.analyze_geometry": {
+        "name": "vision.analyze_geometry",
+        "description": "Analyze contours, aspect ratio, solidity, and sharpness of an object in a bounding box.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "[x, y, w, h] coordinates to analyze.",
+                },
+            },
+            "required": ["bbox"],
+        },
+    },
+    "vision.measure_optical_flow": {
+        "name": "vision.measure_optical_flow",
+        "description": "Measure sub-regional pixel displacement (Farneback optical flow) to quantify motion or stability.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "[x, y, w, h] coordinates to measure.",
+                },
+            },
+            "required": ["bbox"],
+        },
+    },
+}
+
+ALL_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {**TOOL_SCHEMAS, **VISION_INSPECTION_SCHEMAS}
+
+
+def get_openai_tool_definitions(tools: list[str] | None = None) -> list[dict[str, Any]]:
+    """Return standard OpenAI function-calling tool declarations."""
+    selected = tools or list(ALL_TOOL_SCHEMAS.keys())
+    declarations = []
+    for name in selected:
+        schema = ALL_TOOL_SCHEMAS.get(name)
+        if schema:
+            declarations.append({
+                "type": "function",
+                "function": {
+                    "name": schema["name"],
+                    "description": schema["description"],
+                    "parameters": schema["parameters"],
+                },
+            })
+    return declarations
+
 
 
 def format_tools_prompt() -> str:
@@ -244,6 +357,99 @@ def _handle_speech_speak(voice: Any, arguments: dict[str, Any]) -> ToolResult:
     return ToolResult(tool="speech.speak", success=True, output={"spoken": text, "interrupted": interrupt})
 
 
+def _get_frame(frame_provider: Any):
+    if callable(frame_provider):
+        return frame_provider()
+    return frame_provider
+
+
+def _handle_vision_crop_and_enhance(frame_provider: Any, arguments: dict[str, Any]) -> ToolResult:
+    try:
+        from perception.inspection import VisionInspectionEngine
+    except ImportError:
+        return ToolResult(tool="vision.crop_and_enhance", success=False, error="VisionInspectionEngine unavailable")
+
+    frame = _get_frame(frame_provider)
+    if frame is None:
+        return ToolResult(tool="vision.crop_and_enhance", success=False, error="Camera frame unavailable")
+    bbox = arguments.get("bbox")
+    enhance = bool(arguments.get("enhance", False))
+    crop = VisionInspectionEngine.crop_roi(frame, bbox, enhance=enhance)
+    if crop.size == 0:
+        return ToolResult(tool="vision.crop_and_enhance", success=False, error="Invalid crop coordinates or empty ROI")
+    out = {
+        "status": "cropped",
+        "shape": list(crop.shape),
+        "resolution": f"{crop.shape[1]}x{crop.shape[0]}",
+        "mean_intensity": round(float(crop.mean()), 2),
+        "enhanced": enhance,
+    }
+    return ToolResult(tool="vision.crop_and_enhance", success=True, output=out)
+
+
+def _handle_vision_inspect_color_hsv(frame_provider: Any, arguments: dict[str, Any]) -> ToolResult:
+    try:
+        from perception.inspection import VisionInspectionEngine
+    except ImportError:
+        return ToolResult(tool="vision.inspect_color_hsv", success=False, error="VisionInspectionEngine unavailable")
+
+    frame = _get_frame(frame_provider)
+    if frame is None:
+        return ToolResult(tool="vision.inspect_color_hsv", success=False, error="Camera frame unavailable")
+    bbox = arguments.get("bbox")
+    lower = arguments.get("lower_hsv")
+    upper = arguments.get("upper_hsv")
+    if not lower or not upper:
+        return ToolResult(tool="vision.inspect_color_hsv", success=False, error="Missing lower_hsv or upper_hsv")
+    crop = VisionInspectionEngine.crop_roi(frame, bbox)
+    if crop.size == 0:
+        return ToolResult(tool="vision.inspect_color_hsv", success=False, error="Invalid crop coordinates or empty ROI")
+    res = VisionInspectionEngine.inspect_color_hsv(crop, lower, upper)
+    return ToolResult(tool="vision.inspect_color_hsv", success=True, output=res)
+
+
+def _handle_vision_analyze_geometry(frame_provider: Any, arguments: dict[str, Any]) -> ToolResult:
+    try:
+        from perception.inspection import VisionInspectionEngine
+    except ImportError:
+        return ToolResult(tool="vision.analyze_geometry", success=False, error="VisionInspectionEngine unavailable")
+
+    frame = _get_frame(frame_provider)
+    if frame is None:
+        return ToolResult(tool="vision.analyze_geometry", success=False, error="Camera frame unavailable")
+    bbox = arguments.get("bbox")
+    crop = VisionInspectionEngine.crop_roi(frame, bbox)
+    if crop.size == 0:
+        return ToolResult(tool="vision.analyze_geometry", success=False, error="Invalid crop coordinates or empty ROI")
+    res = VisionInspectionEngine.analyze_geometry(crop)
+    return ToolResult(tool="vision.analyze_geometry", success=True, output=res)
+
+
+def _handle_vision_measure_optical_flow(dispatcher: Any, arguments: dict[str, Any]) -> ToolResult:
+    try:
+        from perception.inspection import VisionInspectionEngine
+    except ImportError:
+        return ToolResult(tool="vision.measure_optical_flow", success=False, error="VisionInspectionEngine unavailable")
+
+    frame = _get_frame(dispatcher.frame_provider)
+    if frame is None:
+        return ToolResult(tool="vision.measure_optical_flow", success=False, error="Camera frame unavailable")
+    bbox = arguments.get("bbox")
+    curr_crop = VisionInspectionEngine.crop_roi(frame, bbox)
+    if curr_crop.size == 0:
+        return ToolResult(tool="vision.measure_optical_flow", success=False, error="Invalid crop coordinates or empty ROI")
+    prev_crop = getattr(dispatcher, "_last_optical_flow_crop", None)
+    dispatcher._last_optical_flow_crop = curr_crop
+    if prev_crop is None or prev_crop.shape != curr_crop.shape:
+        return ToolResult(
+            tool="vision.measure_optical_flow",
+            success=True,
+            output={"status": "baseline_established", "is_moving": False, "mean_velocity": 0.0},
+        )
+    res = VisionInspectionEngine.measure_optical_flow(prev_crop, curr_crop)
+    return ToolResult(tool="vision.measure_optical_flow", success=True, output=res)
+
+
 # ----------------------------------------------------------------------
 # ToolDispatcher
 # ----------------------------------------------------------------------
@@ -256,17 +462,24 @@ class ToolDispatcher:
         agent: Any = None,
         voice: Any = None,
         vision_ctx: Any = None,
+        frame_provider: Any = None,
     ):
         self.agent = agent
         self.voice = voice
         self.vision_ctx = vision_ctx
+        self.frame_provider = frame_provider
         self.call_log: list[dict[str, Any]] = []
+        self._last_optical_flow_crop: Any = None
 
         self._handlers: dict[str, Callable[[dict[str, Any]], ToolResult]] = {
             "memory.search": lambda args: _handle_memory_search(self.agent, args),
             "memory.store": lambda args: _handle_memory_store(self.agent, args),
             "vision.get_state": lambda args: _handle_vision_get_state(self.vision_ctx, args),
             "speech.speak": lambda args: _handle_speech_speak(self.voice, args),
+            "vision.crop_and_enhance": lambda args: _handle_vision_crop_and_enhance(self.frame_provider, args),
+            "vision.inspect_color_hsv": lambda args: _handle_vision_inspect_color_hsv(self.frame_provider, args),
+            "vision.analyze_geometry": lambda args: _handle_vision_analyze_geometry(self.frame_provider, args),
+            "vision.measure_optical_flow": lambda args: _handle_vision_measure_optical_flow(self, args),
         }
 
     def register(self, tool_name: str, handler: Callable[[dict[str, Any]], ToolResult]):
@@ -289,6 +502,34 @@ class ToolDispatcher:
 
         self._log_call(tool_name, args, res)
         print(f"[Tool] Executed {tool_name}({args}) -> {'OK' if res.success else 'FAILED'}: {res.output or res.error}")
+        return res
+
+    def execute_tool_call(self, tool_call: dict[str, Any]) -> ToolResult:
+        """Execute a native OpenAI function/tool call dictionary:
+        {'id': 'call_1', 'type': 'function', 'function': {'name': '...', 'arguments': '...'}}
+        """
+        call_id = tool_call.get("id")
+        fn = tool_call.get("function", {})
+        if isinstance(fn, dict) and "name" in fn:
+            name = fn.get("name", "")
+            raw_args = fn.get("arguments", {})
+        else:
+            name = tool_call.get("name", "")
+            raw_args = tool_call.get("arguments", {})
+
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args) if raw_args.strip() else {}
+            except Exception:
+                args = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+
+        res = self.execute(name, args)
+        if call_id:
+            res.tool_call_id = call_id
         return res
 
     def _log_call(self, tool_name: str, arguments: dict[str, Any], result: ToolResult):
@@ -333,3 +574,4 @@ class ToolDispatcher:
         """Parse all requested tool calls in text and execute them."""
         parsed = self.parse_calls(text)
         return [self.execute(tool_name, args) for tool_name, args in parsed]
+

@@ -1,6 +1,6 @@
 # ARIA Agent Roadmap
 
-**Status:** Active — Phase 1 complete; Phase 2 ready to begin
+**Status:** Active — Phases 0–8 complete; Phase 9 (Active OpenCV 5 Micro-Tools) in progress
 **Supersedes:** `ARIA_BUILD_TASKS.md` (its tasks are complete — keep it for history, don't add new tasks there)
 **Extends:** `ARIA_ARCHITECTURE.md`, and reworks the source proposal (the 25-section "Full Companion Agent Architecture" doc) into something buildable incrementally by one person
 **Companion files:** `ARIA_AGENT_PROGRESS.md` (living status — update after every phase), `ARIA_AGENT_PLAYBOOK.md` (how to actually run this with a coding agent)
@@ -124,6 +124,69 @@ Only start if you actually want ARIA to do things beyond real-time conversation 
 
 ---
 
-## Phase 8 — Repository restructuring (last, mechanical only)
+## Phase 8 — Repository restructuring (complete)
 
 Move existing modules into `core/`, `perception/`, `memory/`, `cognition/`, `actions/`, `interaction/` per the original proposal's layout — once the shape of the system has stabilized through phases 1–6/7. Its own dedicated session, no feature changes in the same commit, tests green before and after.
+
+---
+
+## Autonomous Physical AI Architecture (Phases 9–12)
+*Aligning ARIA with the OpenCV AI Competition 2026 rubric ("see, reason, and act").*
+
+### Phase 9 — Active OpenCV 5 Micro-Tools
+
+**Goal:** Transform the vision layer from a passive string generator into an active, on-demand sensor with CPU-optimized routines executing in <5ms.
+
+**Deliverables:**
+- `perception/inspection.py`: `VisionInspectionEngine` with stateless static methods:
+  - `crop_roi(frame, bbox)`: Sub-region extraction with boundary clamping and safe empty fallback.
+  - `inspect_color_hsv(roi, lower_hsv, upper_hsv)`: Morphological color segmentation via `cv2.inRange` + `cv2.morphologyEx` returning pixel coverage ratio and counts.
+  - `analyze_geometry(roi)`: Laplacian sharpness, Canny edge detection, contour hierarchy, aspect ratio, and solidity.
+  - `measure_optical_flow(prev_roi, curr_roi)`: Sub-regional Farneback optical flow returning displacement magnitude and stability.
+- `test_inspection.py`: Hermetic unit test covering all operations with synthetic numpy arrays, verifying safety and <5ms CPU latency.
+
+**Out of scope:** Modifying `agent.py`, `voice.py`, or `run.py`.
+
+**Definition of Done:** `python -m pytest test_inspection.py -v` passes 100%, and full regression suite (145+ tests) remains green.
+
+---
+
+### Phase 10 — Native Tool Schemas & Local LLM Adapter
+
+**Goal:** Replace fragile regex bracket scraping (`[TOOL: ...]`) with standard OpenAI-compatible function calling and local model connectivity.
+
+**Deliverables:**
+- `core/tools.py`: OpenAI-compliant JSON tool definitions (`tools=[{"type": "function", ...}]`).
+- `cognition/llm_interface.py`: Add `tools` parameter to `complete()` and `stream()`, parse `message.tool_calls`, and add `OllamaClient` / local OpenAI-compatible endpoint.
+
+**Out of scope:** Changing `run.py` or the ReAct loop logic.
+
+**Definition of Done:** Unit tests in `test_phase10_tools_llm.py` verifying tool schema declaration, mock tool call parsing, and local endpoint payloads.
+
+---
+
+### Phase 11 — Recursive ReAct Cognitive Engine
+
+**Goal:** Replace legacy heuristic reasoner with a multi-turn ReAct reasoning loop where tool observations are fed back to the LLM.
+
+**Deliverables:**
+- Rebuild `cognition/reasoner.py`: `AgenticReasoner.evaluate_scene(trigger, frame_provider)` with `while finish_reason == "tool_calls"` loop capped at 2 turns.
+- Feed OpenCV inspection observations back as `{"role": "tool", "tool_call_id": ..., "content": ...}` messages before producing a final decision.
+- Add non-blocking status cues ("Inspecting workspace...") to prevent perceived freezing.
+
+**Out of scope:** Background video loop triggers.
+
+**Definition of Done:** Unit and integration tests verifying multi-turn hypothesis testing and observation-driven decisions.
+
+---
+
+### Phase 12 — Autonomous Loops, Visual Anomaly Trigger & Local Actuation
+
+**Goal:** Close the physical AI loop with autonomous visual triggers and local verifiable evidence persistence.
+
+**Deliverables:**
+- `run.py`: Implement non-blocking Snapshot Ring Buffer and `VISUAL_ANOMALY_DETECTED` trigger in `_vision_loop()` to wake the reasoner without vocal cues.
+- `actions/alerter.py`: Local high-resolution evidence crop saving to `./evidence/incident_<timestamp>.jpg`.
+- `memory/writer.py`: Append-only audit logger writing ReAct traces to `./evidence/audit_log.jsonl`.
+
+**Definition of Done:** End-to-end simulation where a visual state change triggers autonomous inspection, evidence capture, and audit log generation without human speech.

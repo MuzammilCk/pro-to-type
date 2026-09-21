@@ -5,6 +5,10 @@ Enforces:
 2. Dirty-state gate: Skips redundant disk writes if semantic/episodic data hasn't changed.
 3. Content validity: Ensures candidate facts and summaries are meaningful before storing.
 """
+from datetime import datetime, timezone
+import json
+import os
+import time
 from typing import Any
 
 
@@ -70,3 +74,42 @@ class MemoryWriter:
             person=identity,
         )
         return cls.save_person(person_memory)
+
+    @classmethod
+    def record_audit_trace(
+        cls,
+        trace_data: dict[str, Any],
+        audit_file: str | None = None,
+    ) -> str:
+        """Append an immutable structured JSONL record to the audit log file.
+
+        Args:
+            trace_data: Dictionary containing trace metadata, ReAct steps, decisions, and evidence.
+            audit_file: Optional path to JSONL log file. Defaults to './evidence/audit_log.jsonl'.
+
+        Returns:
+            The filepath where the audit line was appended.
+        """
+        target_path = audit_file or os.path.join(".", "evidence", "audit_log.jsonl")
+        target_dir = os.path.dirname(os.path.abspath(target_path))
+        os.makedirs(target_dir, exist_ok=True)
+
+        entry = dict(trace_data)
+        if "timestamp" not in entry:
+            entry["timestamp"] = time.time()
+        if "iso_timestamp" not in entry:
+            entry["iso_timestamp"] = datetime.now(timezone.utc).isoformat()
+
+        def _json_default(obj: Any) -> Any:
+            if hasattr(obj, "to_dict") and callable(obj.to_dict):
+                return obj.to_dict()
+            if hasattr(obj, "__dict__"):
+                return obj.__dict__
+            return str(obj)
+
+        line = json.dumps(entry, default=_json_default)
+        with open(target_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+
+        return target_path

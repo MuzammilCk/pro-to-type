@@ -16,6 +16,7 @@ import threading
 import queue
 import json
 import datetime
+from typing import Any
 
 # Auto-load .env for direct `python run.py` execution
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -37,7 +38,7 @@ from cognition import VisionAgent, VisionContext, VoiceSession, AgentState, Reas
 from interaction import ConversationManager, DialogueState, SarvamVoice, MicVAD, UiHub, serve, render_jpeg
 from memory import PersonMemory, SessionManager
 from actions import Alerter
-from core import Event, EventType
+from core import Event, EventType, VISUAL_ANOMALY_DETECTED
 
 
 CONFIG = {
@@ -60,11 +61,18 @@ class VisionAgentApp:
     def __init__(self):
         self.detector = Detector(CONFIG["model_path"])
         self.face_engine = FaceEngine()
-        self.reasoner = Reasoner(face_engine=self.face_engine)
-        self.reasoner.set_authorized(set(self.face_engine.known_faces.keys()))
-        self.alerter = Alerter(enabled=bool(os.getenv("ALERT_SNS_TOPIC_ARN")))
-
         self.agent = VisionAgent()
+        self.reasoner = Reasoner(
+            face_engine=self.face_engine,
+            llm=self.agent.llm,
+            dispatcher=self.agent.dispatcher,
+        )
+        self.reasoner.set_authorized(set(self.face_engine.known_faces.keys()))
+        self.alerter = Alerter(
+            enabled=bool(os.getenv("ALERT_SNS_TOPIC_ARN")),
+            evidence_dir=os.getenv("ARIA_EVIDENCE_DIR", "./evidence"),
+        )
+
         self.voice = SarvamVoice()
         self.memory: dict[str, PersonMemory] = {}
 
@@ -100,6 +108,11 @@ class VisionAgentApp:
         self._latest_frame = None
         self._latest_decision = None
         self._status_text = ""
+
+        # Snapshot ring buffer: decouples inspection tools and AI reasoner from UI/render lock
+        self._snapshot_lock = threading.Lock()
+        self._raw_snapshots: list[Any] = []
+        self._max_snapshots: int = 3
 
         # Face tracking + presence management (architecture: separate seeing from thinking)
         self.tracker = FaceTracker(self.face_engine)
@@ -163,6 +176,12 @@ class VisionAgentApp:
                 time.sleep(0.5)
                 continue
 
+            # Push immediately to snapshot ring buffer (<0.1ms copy)
+            with self._snapshot_lock:
+                self._raw_snapshots.append(frame.copy())
+                if len(self._raw_snapshots) > self._max_snapshots:
+                    self._raw_snapshots.pop(0)
+
             t0 = time.perf_counter()
 
             # YOLO object detection — time-throttled (companion-phase budget).
@@ -180,29 +199,45 @@ class VisionAgentApp:
                 # Log detected objects to console when scene changes
                 current_objects = sorted({d.label for d in (detections or []) if getattr(d, "label", "") != "person"})
                 if current_objects != self._last_logged_objects:
+                    new_objects = set(current_objects) - set(self._last_logged_objects or [])
                     self._last_logged_objects = current_objects
                     if current_objects:
                         print(f"[OBJECT] In view: {', '.join(current_objects)}")
+                    if new_objects:
+                        # Autonomous trigger: visual anomaly detected in workspace
+                        target_det = next((d for d in (detections or []) if getattr(d, "label", "") in new_objects), None)
+                        bbox = getattr(target_det, "box", None) if target_det else None
+                        self.vision_events.put({
+                            "type": VISUAL_ANOMALY_DETECTED,
+                            "new_objects": list(new_objects),
+                            "objects": current_objects,
+                            "bbox": bbox,
+                            "timestamp": time.time(),
+                        })
             else:
                 detections = self._last_detections
 
             # Face tracking (with frame-skipping + downscale)
-            face_results = self.tracker.update(frame, downscale_factor=0.5)
+            try:
+                face_results = self.tracker.update(frame, downscale_factor=0.5)
 
-            # Feed "what ARIA sees" to the conversational brain (Phase 3)
-            if self.vision_ctx is not None:
-                self.vision_ctx.update(face_results, detections)
+                # Feed "what ARIA sees" to the conversational brain (Phase 3)
+                if self.vision_ctx is not None:
+                    self.vision_ctx.update(face_results, detections)
 
-            # Run recognition only on faces that need it (new or stale tracks)
-            if any(fr.get("needs_recognition") for fr in face_results):
-                self.tracker.recognize_faces(frame)
-                face_results = self.tracker.update_results()
+                # Run recognition only on faces that need it (new or stale tracks)
+                if any(fr.get("needs_recognition") for fr in face_results):
+                    self.tracker.recognize_faces(frame)
+                    face_results = self.tracker.update_results()
 
-            # Presence: emit de-duplicated events (person_entered, person_recognized, etc.)
-            self.presence.update(face_results)
+                # Presence: emit de-duplicated events (person_entered, person_recognized, etc.)
+                self.presence.update(face_results)
 
-            # Clean up lost faces
-            self.tracker.cleanup_left_faces()
+                # Clean up lost faces
+                self.tracker.cleanup_left_faces()
+            except Exception as e:
+                print(f"[Vision] Frame tracking warning: {e}")
+                face_results = []
 
             # UI state: normalized face boxes (browser draws the overlays)
             ih, iw = frame.shape[:2]
@@ -280,6 +315,9 @@ class VisionAgentApp:
             self.voice.speak(text)
 
     def _latest_frame_now(self):
+        with self._snapshot_lock:
+            if self._raw_snapshots:
+                return self._raw_snapshots[-1].copy()
         with self._frame_lock:
             return self._latest_frame.copy() if self._latest_frame is not None else None
 
@@ -342,18 +380,19 @@ class VisionAgentApp:
         validates quality, duplicates, and coherence centrally. The old
         "one frame, N embeddings" shortcut can no longer enroll.
         """
+        self._speak("Scanning your face now — please look slightly left, right, and center so I can capture your angles.")
         samples = []
-        for attempt in range(8):  # ~a few seconds of live capture
+        for attempt in range(12):  # ~several seconds of live capture
             frame, face = self._latest_stable_face()
             if frame is not None and face is not None:
                 samples.append((frame, face))
-                time.sleep(0.6)  # natural movement between captures
-            if len(samples) >= 5:
+                time.sleep(0.5)  # natural movement between captures
+            if len(samples) >= 6:
                 break
 
         res = self.face_engine.enroll_identity(name, samples)
         if not res["enrolled"]:
-            self._speak("I couldn't get enough clear, distinct looks at your face. "
+            self._speak("I couldn't get enough distinct angles of your face. "
                         "Let's try that again in better light.")
             print(f"[Enroll] rejected: {res['reason']} ({res['accepted']}/{res['n_samples']} accepted)")
             conv.reset()
@@ -415,7 +454,12 @@ class VisionAgentApp:
         # Phase 2: wire voice events (USER_UTTERANCE, AGENT_*_SPEAKING) into action_events queue
         self.voice.set_event_queue(self.action_events)
         self.vision_ctx = VisionContext()
-        self.agent.attach_tools(voice=self.voice, vision_ctx=self.vision_ctx)
+        self.agent.attach_tools(
+            voice=self.voice,
+            vision_ctx=self.vision_ctx,
+            frame_provider=self._latest_frame_now,
+        )
+        self.reasoner.dispatcher = self.agent.dispatcher
         self.session = VoiceSession(self.agent, self.voice, mic=self.mic,
                                     vision=self.vision_ctx,
                                     agent_state=self.agent_state)
@@ -541,12 +585,93 @@ class VisionAgentApp:
             elif evt_type == EventType.PERSON_LEFT:
                 self._handle_person_left(event, conv)
 
+            elif evt_type in ("visual_anomaly_detected", VISUAL_ANOMALY_DETECTED):
+                self._handle_visual_anomaly(event)
+
             elif evt_type == "frame_summary":
                 self._status_text = (
                     f"Vision: {event['detections']} dets, "
                     f"{event['faces']} faces, "
                     f"{event['authorized']} authorized"
                 )
+
+    def _handle_visual_anomaly(self, event: dict) -> dict[str, Any]:
+        """Process an autonomous visual anomaly trigger through the Agentic ReAct core."""
+        print(f"[Autonomous] Visual anomaly event received: {event}")
+        if self.hub is not None and hasattr(self.hub, "set_aria_state"):
+            self.hub.set_aria_state("thinking")
+
+        snapshot = self._latest_frame_now()
+        bbox = event.get("bbox")
+
+        def _audio_cue(phrase: str):
+            if self.voice is not None and hasattr(self.voice, "speak_async"):
+                self.voice.speak_async(phrase)
+
+        scene_eval = self.reasoner.evaluate_scene(
+            trigger=event,
+            frame_provider=self._latest_frame_now,
+            audio_cue_callback=_audio_cue,
+            max_iterations=2,
+        )
+
+        decision = scene_eval.get("decision", "CLEAR")
+        summary = scene_eval.get("summary", "")
+        trace = scene_eval.get("trace", [])
+        print(f"[Autonomous] ReAct evaluation completed. Decision: {decision} | Summary: {summary}")
+
+        evidence_path = None
+        if snapshot is not None and (decision in ("WARN", "HALT") or event.get("force_evidence")):
+            evidence_path = self.alerter.save_evidence(
+                frame=snapshot,
+                bbox=bbox,
+                prefix=f"anomaly_{decision.lower()}",
+                metadata={"event": event, "decision": decision, "summary": summary},
+            )
+
+        audit_record = {
+            "event_type": "visual_anomaly_detected",
+            "trigger": event,
+            "decision": decision,
+            "summary": summary,
+            "iterations": scene_eval.get("iterations", 0),
+            "evidence_path": evidence_path,
+            "trace": trace,
+            "timestamp": time.time(),
+        }
+        from memory.writer import MemoryWriter
+        MemoryWriter.record_audit_trace(audit_record)
+
+        if decision in ("WARN", "HALT"):
+            alert_payload = {
+                "reason": f"visual_anomaly_{decision.lower()}",
+                "decision": decision,
+                "summary": summary,
+                "evidence_path": evidence_path,
+                "event": event,
+            }
+            self.alerter.fire(alert_payload)
+            warning_msg = f"Attention: {decision} condition detected. {summary}"
+            if self.voice is not None and hasattr(self.voice, "speak_async"):
+                self.voice.speak_async(warning_msg)
+            if self.hub is not None and hasattr(self.hub, "say"):
+                self.hub.say("ARIA", warning_msg)
+
+        if self.hub is not None and hasattr(self.hub, "set_aria_state"):
+            self.hub.set_aria_state("idle")
+
+        return {
+            "decision": decision,
+            "summary": summary,
+            "evidence_path": evidence_path,
+            "trace": trace,
+            "audit_record": audit_record,
+        }
+
+    def trigger_anomaly(self, trigger_data: dict[str, Any]):
+        """Inject a visual anomaly trigger directly into the vision events queue."""
+        event = {"type": VISUAL_ANOMALY_DETECTED, **trigger_data}
+        self.vision_events.put(event)
 
     def _handle_person_left(self, event: dict, conv) -> None:
         name = event.get("name") or event.get("identity", "")

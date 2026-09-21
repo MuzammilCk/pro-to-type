@@ -2,7 +2,7 @@
 
 **Purpose:** the living status tracker for `ARIA_AGENT_ROADMAP.md`. Read this first in any new session to know what's actually done (and actually verified) vs. what's next. Full usage instructions are in `ARIA_AGENT_PLAYBOOK.md`.
 
-**Current status:** Phase 8 implemented, cleaned, and test-verified (145/145 passing). Full repository restructuring into clean modular packages (`core/`, `perception/`, `memory/`, `cognition/`, `interaction/`, `actions/`) with 19 legacy root shims completely removed, all tests and utility scripts migrated to domain package imports, and clean root verified with zero regressions across all 145 tests. All roadmap phases complete.
+**Current status:** Phase 12 implemented and verified (187/187 passing). Physical AI Visual Agent upgrade (Phases 9–12) 100% complete! End-to-end autonomous loops, active visual sensing micro-tools, native JSON ReAct engine, snapshot ring buffer, local evidence persistence, and immutable JSONL audit logging verified.
 
 ---
 
@@ -138,6 +138,42 @@
 3. `python -m pytest -v`: 145 passed, 1 warning in 10.07s (100% passing across entire repository).
 4. `python -c "from run import VisionAgentApp; print('VisionAgentApp imported successfully')"`
 **Result:** 145/145 tests passing. Clean root directory achieved with zero logic regressions. Definition of Done 100% satisfied.
+**Follow-ups spawned:** none.
+
+### Phase 9 — Active OpenCV 5 Micro-Tools — 2026-09-21
+**Commit(s):** pending
+**What changed:** Implemented `perception/inspection.py` with standalone `VisionInspectionEngine` containing stateless, CPU-optimized computer vision inspection routines: `crop_roi` (boundary clamping, safe empty fallback, optional CLAHE), `inspect_color_hsv` (morphological color segmentation via inRange + morphologyEx), `analyze_geometry` (Canny edge detection, contour hierarchy, aspect ratio, solidity, Laplacian sharpness), and `measure_optical_flow` (Gunnar Farneback dense optical flow for velocity/stability). Exported `VisionInspectionEngine` in `perception/__init__.py`. Created hermetic unit test suite `test_inspection.py` with 14 unit tests validating functional correctness, empty/invalid input safety, and latency benchmarks (<5ms CPU budget).
+**Verification run:**
+1. `python -m pytest test_inspection.py -v`: 14 passed in 1.07s.
+2. `python -m pytest -q`: 159 passed, 1 warning in 9.39s (100% passing across entire repository).
+**Result:** 159/159 tests passing. All operations confirmed executing in under 5ms on CPU (crop_roi ~0.01ms, inspect_color_hsv ~0.53ms, analyze_geometry ~0.49ms, measure_optical_flow ~1.26ms). Definition of Done 100% satisfied.
+**Follow-ups spawned:** Phase 10 — Native Tool Schemas & Local LLM Adapter (`core/tools.py` and `cognition/llm_interface.py`).
+
+### Phase 10 — Native Tool Schemas & Local LLM Adapter — 2026-09-21
+**Commit(s):** pending
+**What changed:** Replaced regex-based tool formatting with OpenAI-compatible JSON function definitions (`get_openai_tool_definitions()`, `VISION_INSPECTION_SCHEMAS`, `ALL_TOOL_SCHEMAS`) in `core/tools.py`. Upgraded `ToolResult` with `tool_call_id` and `to_message()` for direct OpenAI `role="tool"` conversion. Upgraded `ToolDispatcher` with `execute_tool_call()` (native OpenAI tool-call parsing) and active vision inspection handlers operating on live frame providers. Upgraded `cognition/llm_interface.py` with `LLMResponse` (supporting `tool_calls` and `finish_reason`), updated `OpenRouterClient` with native `tools` payloads, implemented local offline `OllamaClient` (`http://localhost:11434/v1`), and updated `LocalFallbackLLM` with simulated tool-calling for offline hermetic testing. Added 10 unit/integration tests in `test_phase10_tools_llm.py`.
+**Verification run:**
+1. `python -m pytest test_phase10_tools_llm.py -v`: 10 passed in 0.98s.
+2. `python -m pytest -q`: 169 passed, 1 warning in 8.83s (100% passing across entire repository).
+**Result:** 169/169 tests passing. Native function-calling protocol verified end-to-end with zero regressions. Definition of Done 100% satisfied.
+**Follow-ups spawned:** Phase 11 — Recursive ReAct Cognitive Engine (`cognition/reasoner.py`).
+
+### Phase 11 — Recursive ReAct Cognitive Engine — 2026-09-21
+**Commit(s):** pending
+**What changed:** Rebuilt `cognition/reasoner.py` with `AgenticReasoner.evaluate_scene()` implementing a closed-loop multi-turn ReAct cognitive engine (`Thought -> Action/Tool -> Observation -> Final Decision`). Connected OpenAI-format micro-tool outputs (`role="tool"`) back into conversation context to inform subsequent reasoning turns. Implemented a hard iteration cap at 2 cycles to bound execution latency under real-time constraints (<2s total). Integrated immediate non-blocking audio feedback callbacks on tool invocation. Preserved full backward compatibility for `Reasoner.evaluate()` and aliased `AgenticReasoner`. Exported `AgenticReasoner` in `cognition/__init__.py`. Added 6 unit/integration tests in `test_phase11_react_reasoner.py`.
+**Verification run:**
+1. `python -m pytest test_phase11_react_reasoner.py -v`: 6 passed in 0.96s.
+2. `python -m pytest -q`: 175 passed, 1 warning in 7.09s (100% passing across entire repository).
+**Result:** 175/175 tests passing. Multi-turn hypothesis testing, tool execution reflection, and decision classification (CLEAR, WARN, HALT, ENROLL) verified. Definition of Done 100% satisfied.
+**Follow-ups spawned:** Phase 12 — Autonomous Loops, Visual Anomaly Trigger & Local Actuation (`run.py`, `actions/alerter.py`, `memory/writer.py`).
+
+### Phase 12 — Autonomous Loops, Visual Anomaly Trigger & Local Actuation — 2026-09-21
+**Commit(s):** pending
+**What changed:** Implemented non-blocking Snapshot Ring Buffer (`_raw_snapshots`, `_max_snapshots=3`, `_snapshot_lock`) in `run.py` to decouple CV micro-tools and LLM reasoning from the UI/render `_frame_lock`, preventing CPU frame lock starvation (<0.2ms copy latency). Added autonomous `VISUAL_ANOMALY_DETECTED` trigger in `_vision_loop()` to initiate cognitive ReAct scene investigation when new objects enter the workspace without human voice cues. Upgraded `actions/alerter.py` with `save_evidence()` saving high-resolution frames and bounding-box crops to `./evidence/*.jpg` with optional companion JSON metadata sidecars and in-memory alert history tracking. Upgraded `memory/writer.py` with `record_audit_trace()` appending immutable, structured JSONL audit entries with ISO timestamps and full ReAct traces to `./evidence/audit_log.jsonl`. Wired `AgenticReasoner` and `frame_provider` across `run.py` and `cognition/agent.py`. Added 12 unit/integration tests in `test_phase12_autonomous.py`.
+**Verification run:**
+1. `python -m pytest test_phase12_autonomous.py -v`: 12 passed in 2.41s.
+2. `python -m pytest -q`: 187 passed, 1 warning in 17.05s (100% passing across entire repository).
+**Result:** 187/187 tests passing. Autonomous visual trigger execution without microphone input, non-blocking frame buffer latency, high-res local evidence crop persistence, and immutable audit trace logging verified. Definition of Done 100% satisfied.
 **Follow-ups spawned:** none.
 
 ---

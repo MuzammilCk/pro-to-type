@@ -26,6 +26,10 @@ class EventType(str, Enum):
     AGENT_STOPPED_SPEAKING = "agent_stopped_speaking"
 
 
+# Phase 12 autonomous trigger event type constant
+VISUAL_ANOMALY_DETECTED = "visual_anomaly_detected"
+
+
 @dataclass
 class Event:
     type: EventType

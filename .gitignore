@@ -35,3 +35,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Runtime evidence & audit logs
+evidence/*.jpg
+evidence/*.json
+evidence/audit_log.jsonl
+!evidence/.gitkeep

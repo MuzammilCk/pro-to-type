@@ -5,6 +5,7 @@ from .face_pattern import FacePatternEngine, FacePatternEngine as FacePattern
 from .tracker import FaceTracker
 from .presence import PresenceManager
 from .input_source import InputSource, WebcamSource, IPCameraSource, FileSource, InputManager
+from .inspection import VisionInspectionEngine
 
 __all__ = [
     "Detector",
@@ -19,4 +20,6 @@ __all__ = [
     "IPCameraSource",
     "FileSource",
     "InputManager",
+    "VisionInspectionEngine",
 ]
+

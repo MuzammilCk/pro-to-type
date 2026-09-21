@@ -122,6 +122,44 @@ the Roadmap, and require real verification output before it counts as
 done.]
 ```
 
+**Phase 9:**
+```
+Proceed with Phase 9 of the upgrade: create perception/inspection.py containing a
+standalone class VisionInspectionEngine with stateless, CPU-optimized OpenCV 5 routines:
+crop_roi(frame, bbox), inspect_color_hsv(roi, lower_hsv, upper_hsv), analyze_geometry(roi),
+and measure_optical_flow(prev_roi, curr_roi). All routines must handle empty/out-of-bounds crops
+safely and execute in under 5 ms on CPU. Do not touch agent.py, voice.py, or run.py yet.
+Create a hermetic unit test file test_inspection.py covering all methods with numpy frames,
+run pytest -v, and show the passing output.
+```
+
+**Phase 10:**
+```
+Implement Phase 10: Native Tool Schemas & Local LLM Adapter.
+Update core/tools.py to replace regex bracket parsing with OpenAI-compliant function declarations
+(tools=[{"type": "function", ...}]). Update cognition/llm_interface.py to accept tools payloads,
+parse native message.tool_calls, and support local Ollama / OpenAI-compatible endpoints.
+Add unit tests in test_phase10_tools_llm.py proving schema validation and mock tool-calling execution.
+```
+
+**Phase 11:**
+```
+Implement Phase 11: Recursive ReAct Cognitive Engine.
+Rebuild cognition/reasoner.py with AgenticReasoner.evaluate_scene(), executing a closed
+while finish_reason == "tool_calls" loop capped at 2 turns. Return OpenCV inspection observations
+as role="tool" messages to the model. Emit non-blocking audio cues to prevent UI stalls.
+Verify multi-turn hypothesis testing with hermetic tests.
+```
+
+**Phase 12:**
+```
+Implement Phase 12: Autonomous Loops, Visual Anomaly Trigger & Local Actuation.
+Add a non-blocking Snapshot Ring Buffer and VISUAL_ANOMALY_DETECTED trigger in run.py _vision_loop().
+Update actions/alerter.py to save high-res crops to ./evidence/incident_<ts>.jpg.
+Update memory/writer.py to append ReAct audit traces to ./evidence/audit_log.jsonl.
+Verify end-to-end autonomous visual triggers without microphone input.
+```
+
 ## Update prompt (after every verified phase)
 
 ```

@@ -2,11 +2,13 @@
 
 from .llm_interface import (
     LLMClient,
+    LLMResponse,
     OpenRouterClient,
+    OllamaClient,
     LocalFallbackLLM,
     BedrockLLM,
 )
-from .reasoner import Reasoner
+from .reasoner import Reasoner, AgenticReasoner
 from .companion import ProactiveEngine
 from .agent import (
     VisionAgent,
@@ -19,10 +21,13 @@ from .agent import (
 
 __all__ = [
     "LLMClient",
+    "LLMResponse",
     "OpenRouterClient",
+    "OllamaClient",
     "LocalFallbackLLM",
     "BedrockLLM",
     "Reasoner",
+    "AgenticReasoner",
     "ProactiveEngine",
     "VisionAgent",
     "VisionContext",
@@ -31,3 +36,5 @@ __all__ = [
     "AgentState",
     "WorldState",
 ]
+
+

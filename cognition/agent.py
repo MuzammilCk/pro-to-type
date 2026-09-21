@@ -70,10 +70,12 @@ class VisionAgent:
         self.llm, self.llm_name = self._select_backend()
         print(f"[Agent] LLM backend: {self.llm_name}")
 
-    def attach_tools(self, voice=None, vision_ctx=None):
-        """Wire voice synthesizer and vision context into the tool dispatcher."""
+    def attach_tools(self, voice=None, vision_ctx=None, frame_provider=None):
+        """Wire voice synthesizer, vision context, and frame provider into the tool dispatcher."""
         self.dispatcher.voice = voice
         self.dispatcher.vision_ctx = vision_ctx
+        if frame_provider is not None:
+            self.dispatcher.frame_provider = frame_provider
 
     def _select_backend(self):
         """Pick the best available LLM backend (no AWS needed for local testing)."""

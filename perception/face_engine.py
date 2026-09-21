@@ -32,7 +32,7 @@ MARGIN_MIN = float(os.getenv("ARIA_MARGIN_MIN", "0.05"))
 #                        samples do not look like ONE person
 ENROLL_MIN_SAMPLES = int(os.getenv("ARIA_ENROLL_MIN_SAMPLES", "3"))
 ENROLL_TARGET_SAMPLES = 5
-ENROLL_DUPLICATE_SIM = 0.995
+ENROLL_DUPLICATE_SIM = float(os.getenv("ARIA_ENROLL_DUPLICATE_SIM", "0.998"))
 ENROLL_COHERENCE_MIN = 0.40
 
 
@@ -102,6 +102,8 @@ class FaceEngine:
         Higher = sharper, Lower = blurrier.
         Research: blurry faces significantly degrade SFace accuracy.
         """
+        if not np.all(np.isfinite(face[:4])):
+            return 0.0
         x, y, w, h = [int(v) for v in face[:4]]
         x1, y1 = max(0, x), max(0, y)
         x2, y2 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
@@ -117,13 +119,15 @@ class FaceEngine:
         Factors: face size relative to frame, confidence score, blur.
         Returns quality score 0.0-1.0; lower quality → higher threshold.
         """
+        if not np.all(np.isfinite(face[:4])):
+            return 0.0
         x, y, w, h = [int(v) for v in face[:4]]
         h_frame, w_frame = frame.shape[:2]
         size_ratio = (w * h) / (w_frame * h_frame)
         # YuNet face row layout: [x, y, w, h, x_re, y_re, x_le, y_le,
         # x_nose, y_nose, x_mouth_r, y_mouth_r, x_mouth_l, y_mouth_l,
         # score]. face[4] is an eye COORDINATE, not the detection score.
-        confidence = float(face[14]) if len(face) > 14 else 0.5
+        confidence = float(face[14]) if len(face) > 14 and np.isfinite(face[14]) else 0.5
         size_score = min(1.0, size_ratio * 25)  # 4%+ of frame = full marks
         conf_score = max(0.5, min(1.0, confidence))
         blur = self._blur_score(frame, face)
@@ -138,9 +142,11 @@ class FaceEngine:
         if faces[1] is None:
             return np.empty((0, 0))
 
-        # Filter by minimum face size
+        # Filter by minimum face size and non-finite detector outputs
         valid = []
         for face in faces[1]:
+            if not np.all(np.isfinite(face)):
+                continue
             x, y, fw, fh = [int(v) for v in face[:4]]
             if fw >= min_size and fh >= min_size:
                 valid.append(face)
