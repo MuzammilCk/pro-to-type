@@ -590,8 +590,12 @@ class VisionAgentApp:
 
             timeout = 12.0 if self.mic is not None else 12.0
             self.hub.set_aria_state("listening")
+            _t_listen_entry = time.time()
             transcript = self.voice.listen(timeout=timeout, phrase_limit=8,
                                            mic=self.mic)
+            _t_listen_exit = time.time()
+            if transcript:
+                print(f"[Timing] listen() total wall time: {_t_listen_exit - _t_listen_entry:.3f}s")
             if not transcript:
                 # Re-check presence right after timeout before burning another idle turn
                 if self.vision_ctx is not None and "No one is in view" in self.vision_ctx.context_text():
@@ -612,9 +616,12 @@ class VisionAgentApp:
             idle_turns = 0
             if self.session is not None:
                 self.session.touch_activity()
+            _t_think_start = time.time()
             self.hub.set_aria_state("thinking")
 
             response, action = conv.handle_response(transcript, conv.current_identity, face_data)
+            _t_think_done = time.time()
+            print(f"[Timing] LLM think: {_t_think_done - _t_think_start:.3f}s")
 
             if action == "enroll":
                 conv.state = "ENROLLING"

@@ -204,8 +204,10 @@ class SarvamVoice:
         Echo safety (laptop mic + speakers): MicVAD knows when ARIA is talking
         and ignores that audio entirely, so ARIA never transcribes itself.
         """
+        _t_listen_start = _time.time()
         print(f"[Voice] _listen_vad waiting for speech (timeout={timeout:.1f}s, phrase_limit={phrase_limit:.1f}s)...")
         pcm = mic.wait_for_utterance(max_wait=timeout, max_utterance=phrase_limit)
+        _t_onset = _time.time()
         if self._interrupt_flag.is_set():
             print("[Voice] _listen_vad aborted: interrupt flag set")
             return ""
@@ -213,9 +215,15 @@ class SarvamVoice:
             print(f"[Voice] _listen_vad timed out after {timeout:.1f}s (no utterance captured)")
             return ""
         dur = len(pcm) / 16000.0
-        print(f"[Voice] _listen_vad captured utterance: {dur:.2f}s ({len(pcm)} samples). Transcribing...")
+        print(f"[Voice] _listen_vad captured utterance: {dur:.2f}s ({len(pcm)} samples). "
+              f"Time-to-speech-onset: {_t_onset - _t_listen_start:.3f}s")
+        print(f"[Timing] Utterance ready → handing to STT  (wall={_t_onset:.3f})")
         if self.available():
+            _t_stt_start = _time.time()
             text = self._transcribe_pcm(pcm.tobytes())
+            _t_stt_done = _time.time()
+            print(f"[Timing] STT (Sarvam) latency: {_t_stt_done - _t_stt_start:.3f}s  "
+                  f"| total gap (listen-start → transcript): {_t_stt_done - _t_listen_start:.3f}s")
             if text:
                 print(f"[Voice] STT (Sarvam) transcript: '{text}'")
                 return text
@@ -224,7 +232,10 @@ class SarvamVoice:
             try:
                 import speech_recognition as sr
                 audio = sr.AudioData(pcm.tobytes(), 16000, 2)
+                _t_stt_start = _time.time()
                 text = sr.Recognizer().recognize_google(audio)
+                _t_stt_done = _time.time()
+                print(f"[Timing] STT (Google/local) latency: {_t_stt_done - _t_stt_start:.3f}s")
                 print(f"[Voice] STT (Google/local) transcript: '{text}'")
                 return text
             except Exception as e:
@@ -326,6 +337,7 @@ class SarvamVoice:
         cb = self._on_speaking
         if cb:
             cb(True)
+        _t_started = _time.time()
         if self._event_queue is not None:
             self._event_queue.put(Event(type=EventType.AGENT_STARTED_SPEAKING, data={"text": text}))
         print(f"[EVENT] AGENT_STARTED_SPEAKING: len={len(text)}")
@@ -345,11 +357,15 @@ class SarvamVoice:
             else:
                 print(f"[TTS] {text}")
         finally:
+            _t_stopped = _time.time()
             if cb:
-                cb(False)
+                cb(False)  # echo guard re-arms here (mic suppression lifted)
+            _t_rearmed = _time.time()
             if self._event_queue is not None:
                 self._event_queue.put(Event(type=EventType.AGENT_STOPPED_SPEAKING, data={"text": text}))
-            print("[EVENT] AGENT_STOPPED_SPEAKING")
+            print(f"[EVENT] AGENT_STOPPED_SPEAKING")
+            print(f"[Timing] TTS duration: {_t_stopped - _t_started:.3f}s  "
+                  f"| echo-guard re-arm lag: {(_t_rearmed - _t_stopped)*1000:.1f}ms")
             self._interrupt_flag.clear()
 
     def speak_async(self, text: str) -> threading.Thread:
