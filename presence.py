@@ -36,6 +36,7 @@ class PresenceManager:
     """
 
     GREETING_COOLDOWN = 300.0  # 5 minutes — don't re-greet same person
+    UNKNOWN_GREETING_COOLDOWN = 60.0  # 1 minute — limit unknown stranger greetings session-wide
 
     def __init__(self, event_queue: queue.Queue):
         self.tracks: dict[str, TrackState] = {}
@@ -45,6 +46,7 @@ class PresenceManager:
         # steps out and back in gets a NEW track_id, which used to bypass the
         # per-track greeting cooldown entirely. Gate greetings by identity too.
         self._identity_greeted: dict[str, float] = {}  # name -> last greeting time
+        self._last_unknown_greeting: float = 0.0
 
     def update(self, face_results: list[dict], now: float | None = None):
         """Process face detection results and emit state-transition events."""
@@ -119,20 +121,24 @@ class PresenceManager:
 
     def mark_greeted(self, track_id: str, now: float | None = None):
         """Mark a track as greeted so we don't re-trigger the same event."""
-        if track_id in self.tracks:
-            ts = now or time.time()
-            track = self.tracks[track_id]
+        ts = now or time.time()
+        track = self.tracks.get(track_id)
+        if track:
             track.greeted = True
             track.greeting_time = ts
             if track.identity and track.identity != "unknown":
                 self._identity_greeted[track.identity] = ts
+            else:
+                self._last_unknown_greeting = ts
+        else:
+            self._last_unknown_greeting = ts
 
     def should_greet(self, track_id: str) -> bool:
         """Check if this track should be greeted (haven't greeted recently).
 
-        Checks both track-level and identity-level cooldowns. An unknown
-        track that just churned off a recently-greeted track should NOT
-        trigger a second greeting.
+        Checks track-level, identity-level, and session-wide unknown cooldowns.
+        An unknown track that just churned off a recently-greeted track, or a phantom
+        track appearing while a known user is present, will NOT trigger a greeting.
         """
         if track_id not in self.tracks:
             return False
@@ -142,10 +148,13 @@ class PresenceManager:
         if track.greeted and now - track.greeting_time <= self.GREETING_COOLDOWN:
             return False
         # Identity-level cooldown (catches churn: same person, new track ID)
-        # Only applicable if the track currently carries a known identity.
         if track.identity and track.identity != "unknown":
             last = self._identity_greeted.get(track.identity)
             if last is not None and now - last <= self.GREETING_COOLDOWN:
+                return False
+        else:
+            # Session-wide unknown cooldown (at most 1 unknown greeting per 60s)
+            if self._last_unknown_greeting and now - self._last_unknown_greeting < self.UNKNOWN_GREETING_COOLDOWN:
                 return False
         return True
 
@@ -191,7 +200,11 @@ class PresenceManager:
                            previous_identity: str | None = None):
         track = self.tracks.get(track_id)
         if track:
-            track.identity = "unknown"
+            tentative = fr.get("identity")
+            if tentative and tentative != "unknown":
+                track.identity = tentative
+            else:
+                track.identity = "unknown"
             track.greeted = False
         self._emit("person_unrecognized", track_id, {
             "score": fr.get("distance", 0.0),

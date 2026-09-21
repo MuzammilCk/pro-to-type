@@ -11,6 +11,7 @@ from events import Event, EventType
 
 _SARVAM_KEY = os.getenv("SARVAM_API_KEY")
 _SARVAM_STT_WS = "wss://api.sarvam.ai/speech-to-text/ws"
+_SARVAM_STT_REST = "https://api.sarvam.ai/speech-to-text"
 _SARVAM_TTS_WS = "wss://api.sarvam.ai/text-to-speech/ws"
 DEFAULT_LANG = "en-US"
 
@@ -147,8 +148,9 @@ class SarvamVoice:
             connect_kwargs = {"additional_headers": headers}
             if websockets.__version__ < "13.0":
                 connect_kwargs = {"extra_headers": headers}
+            lang = self.lang if self.lang in _SARVAM_TTS_LANGS else "en-IN"
             async with websockets.connect(_SARVAM_STT_WS, **connect_kwargs) as ws:
-                await ws.send(json.dumps({"config": {"model": "saaras:v2.1", "language_code": self.lang}}))
+                await ws.send(json.dumps({"config": {"model": "saaras:v3", "language_code": lang}}))
 
                 stop_rec = threading.Event()
 
@@ -245,37 +247,36 @@ class SarvamVoice:
         return ""
 
     def _transcribe_pcm(self, pcm_bytes: bytes) -> str:
-        """Transcribe an already-captured PCM16/16k buffer via Saaras STT."""
-        transcript = ""
+        """Transcribe an already-captured PCM16/16k buffer via Saaras STT (REST API)."""
+        if not pcm_bytes or not self.api_key:
+            return ""
 
-        async def _run():
-            nonlocal transcript
-            headers = {"api-subscription-key": self.api_key}
-            connect_kwargs = {"additional_headers": headers}
-            if websockets.__version__ < "13.0":
-                connect_kwargs = {"extra_headers": headers}
-            async with websockets.connect(_SARVAM_STT_WS, **connect_kwargs) as ws:
-                await ws.send(json.dumps({"config": {"model": "saaras:v2.1", "language_code": self.lang}}))
-                step = 3200  # 0.1s of 16kHz int16 mono
-                for i in range(0, len(pcm_bytes), step):
-                    await ws.send(pcm_bytes[i:i + step])
-                deadline = _time.time() + 6.0
-                while _time.time() < deadline:
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                    except (asyncio.TimeoutError, websockets.ConnectionClosed):
-                        break
-                    data = json.loads(msg)
-                    if data.get("transcript"):
-                        transcript = data["transcript"]
-                    if data.get("is_final", False):
-                        break
-
+        lang = self.lang if self.lang in _SARVAM_TTS_LANGS else "en-IN"
         try:
-            asyncio.run(_run())
+            import io
+            import wave
+            import httpx
+
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(pcm_bytes)
+            buf.seek(0)
+
+            headers = {"api-subscription-key": self.api_key}
+            files = {"file": ("audio.wav", buf.read(), "audio/wav")}
+            data = {"model": "saaras:v3", "language_code": lang}
+            r = httpx.post(_SARVAM_STT_REST, headers=headers, files=files, data=data, timeout=6.0)
+            if r.status_code == 200:
+                res = r.json()
+                return res.get("transcript", "").strip()
+            else:
+                print(f"[STT] Sarvam STT HTTP {r.status_code}: {r.text[:120]}")
         except Exception as e:
             print(f"[STT] Sarvam transcribe error: {e}")
-        return transcript.strip()
+        return ""
 
     def _listen_local(self) -> str:
         """Local fallback using sounddevice for audio capture (no pyaudio needed).

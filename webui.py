@@ -401,7 +401,7 @@ setInterval(poll, 500);
 
 def serve(hub: UiHub, port: int | None = None) -> tuple[ThreadingHTTPServer, threading.Thread]:
     """Start the UI server bound to 127.0.0.1 on a daemon thread."""
-    port = port or int(os.environ.get("ARIA_UI_PORT", "8080"))
+    port = port if port is not None else int(os.environ.get("ARIA_UI_PORT", "8200"))
 
     class Bound(_Handler):
         pass

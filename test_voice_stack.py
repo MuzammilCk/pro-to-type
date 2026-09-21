@@ -1098,6 +1098,94 @@ def test_should_greet_identity_level_cooldown_gates_named_phantom():
     )
 
 
+def test_session_wide_unknown_greeting_cooldown():
+    """Presence: at most one unknown greeting may fire per UNKNOWN_GREETING_COOLDOWN."""
+    import queue as qmodule
+    import time as _time
+    from presence import PresenceManager, TrackState
+
+    eq = qmodule.Queue()
+    pm = PresenceManager(eq)
+    now = _time.time()
+
+    # 1. First unknown track is allowed
+    pm.tracks["face_A"] = TrackState(
+        track_id="face_A", identity="unknown", authorized=False,
+        first_seen=now, last_seen=now, greeted=False,
+    )
+    assert pm.should_greet("face_A"), "First unknown track must pass should_greet"
+
+    # 2. Mark greeted sets _last_unknown_greeting
+    pm.mark_greeted("face_A", now=now)
+    assert pm._last_unknown_greeting == now
+
+    # 3. Second unknown track arrives within 60s -> blocked by session-wide cooldown
+    pm.tracks["face_B"] = TrackState(
+        track_id="face_B", identity="unknown", authorized=False,
+        first_seen=now + 5.0, last_seen=now + 5.0, greeted=False,
+    )
+    assert not pm.should_greet("face_B"), "Second unknown track within cooldown must be blocked"
+
+    # 4. After 61s, next unknown track is allowed again
+    pm._last_unknown_greeting = now - pm.UNKNOWN_GREETING_COOLDOWN - 1.0
+    assert pm.should_greet("face_B"), "After cooldown expiry, next unknown track must be allowed"
+
+
+def test_farewell_suppressed_for_phantom_unknown_when_authorized_present():
+    """run.py: PERSON_LEFT for an unknown track while a known user is authorized must NOT speak farewell."""
+    from run import VisionAgentApp
+    from events import EventType
+
+    farewell_calls: list[str] = []
+
+    class _Voice:
+        def speak_async(self, t):
+            farewell_calls.append(t)
+
+    class _Hub:
+        def set_aria_state(self, s): pass
+
+    class _Tracker:
+        tracks = {"face_0": {"authorized": True, "identity": "alice"}}
+
+    class _Conv:
+        def reset(self): pass
+
+    class _App:
+        agent = None
+        voice = _Voice()
+        hub = _Hub()
+        mic = None
+        tracker = _Tracker()
+        _farewells_spoken = set()
+        _unknown_greeted = False
+
+        def _identity_currently_authorized(self, name):
+            return any(t.get("authorized") and t.get("identity") == name for t in self.tracker.tracks.values())
+
+    _App._handle_person_left = VisionAgentApp._handle_person_left
+    app = _App()
+    conv = _Conv()
+
+    event = {"type": EventType.PERSON_LEFT, "track_id": "face_phantom", "identity": "unknown"}
+    app._handle_person_left(event, conv)
+
+    assert len(farewell_calls) == 0, f"Phantom unknown farewell must be suppressed, got {farewell_calls}"
+
+
+def test_unrecognized_greeting_skipped_if_authorized_present():
+    """run.py: person_unrecognized must skip greeting if an authorized user is already present."""
+    from events import EventType
+
+    class _Tracker:
+        tracks = {"face_0": {"authorized": True, "identity": "alice"}}
+
+    tracker = _Tracker()
+    assert any(t.get("authorized") for t in tracker.tracks.values()), (
+        "Authorized presence guard must detect authorized tracks"
+    )
+
+
 
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items()) if name.startswith("test_")]

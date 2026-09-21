@@ -89,6 +89,7 @@ class VisionAgentApp:
         self.action_events: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._farewells_spoken: set[str] = set()
+        self._unknown_greeted: bool = False
 
         # Restore session state
         saved = SessionManager.load_current_state()
@@ -449,7 +450,6 @@ class VisionAgentApp:
                 self._dialogue_loop(conv, name, face_data)
 
             elif evt_type == "person_unrecognized":
-                self._farewells_spoken.discard("unknown")
                 # B1 fix: the greeting is built once and spoken once by the
                 # caller (start_for returns text; playback happens here).
                 prev = event.get("previous_identity")
@@ -471,7 +471,21 @@ class VisionAgentApp:
                     self._speak("Hold on — I've lost track of who you are. "
                                 "Let me take a fresh look.")
 
-                # Gate: skip the greeting entirely for phantom churn tracks.
+                # Cold-start / entry grace window: give face recognition up to 350ms to verify
+                # a freshly appeared track before assuming it is an unknown stranger.
+                track = self.presence.tracks.get(track_id)
+                if track and not track.authorized and (time.time() - track.first_seen < 0.35):
+                    rem = 0.35 - (time.time() - track.first_seen)
+                    if rem > 0:
+                        time.sleep(rem)
+
+                # Gate 1: If settled as authorized, or if an authorized person is present, skip unknown greeting
+                if (track and track.authorized) or any(t.get("authorized") for t in self.tracker.tracks.values()):
+                    print(f"[Presence] Skipping unknown greeting for {track_id!r} "
+                          "(authorized person currently present)")
+                    continue
+
+                # Gate 2: skip the greeting entirely for phantom churn tracks.
                 # should_greet() checks both the track-level cooldown AND the
                 # identity-level cooldown — so a phantom track that spawned
                 # right after another unknown was just greeted will be
@@ -481,6 +495,8 @@ class VisionAgentApp:
                           "(already greeted recently)")
                     continue
 
+                # Only clear unknown-farewell suppression once a real greeting is actually spoken
+                self._farewells_spoken.discard("unknown")
                 face_data = {
                     "authorized": False,
                     "face_bbox": event.get("face_bbox", (0, 0, 0, 0)),
@@ -493,6 +509,7 @@ class VisionAgentApp:
 
                 greeting = conv.start_for("unknown", face_data)
                 self._speak(greeting)
+                self._unknown_greeted = True
                 self._dialogue_loop(conv, "unknown", face_data)
 
             elif evt_type == EventType.PERSON_LEFT:
@@ -530,10 +547,14 @@ class VisionAgentApp:
         # alone so the active dialogue continues uninterrupted.
         if name and name not in ("", "unknown") and self._identity_currently_authorized(name):
             pass  # person still present on another track — no farewell
+        elif key == "unknown" and (not getattr(self, "_unknown_greeted", False) or any(t.get("authorized") for t in self.tracker.tracks.values())):
+            pass  # phantom track expired while an authorized person is present (or no stranger was ever greeted) — no farewell
         elif key in self._farewells_spoken:
             pass  # farewell already spoken for this identity since last confirmation
         else:
             self._farewells_spoken.add(key)
+            if key == "unknown":
+                self._unknown_greeted = False
             self.hub.set_aria_state("idle")
             self.voice.speak_async(farewell)
 
