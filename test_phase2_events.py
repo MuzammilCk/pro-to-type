@@ -12,9 +12,9 @@ import queue
 import time
 import pytest
 
-from events import Event, EventType
-from presence import PresenceManager
-from voice import SarvamVoice
+from core.events import Event, EventType
+from perception.presence import PresenceManager
+from interaction.voice import SarvamVoice
 
 
 def test_phase2_exactly_six_event_types():

@@ -80,19 +80,41 @@ class ProactiveEngine:
         return max(30.0, base)
 
     def _allowed(self) -> bool:
-        now = time.time()
-        if now - self._last_spoke < self.MIN_INTERVAL:
-            return False
-        self._hour_count = [t for t in self._hour_count if now - t < 3600]
-        if len(self._hour_count) >= self.MAX_PER_HOUR:
-            return False
-        if self.session is not None and self.session.busy:
-            return False
-        if self.ONLY_WHEN_SEEN and self.vision is not None:
+        from core.policy import should_proactive_remark
+        is_busy = bool(self.session is not None and getattr(self.session, "busy", False))
+        agent_state = getattr(self.session, "agent_state", None) if self.session else None
+        world_state = getattr(self.vision, "world_state", None) if self.vision else None
+
+        # Ensure faces representation matches vision context
+        faces = []
+        if self.vision is not None:
             summary = self.vision.context_text()
-            if "No one is in view" in summary or "No vision input" in summary:
-                return False
-        return True
+            if "No one is in view" not in summary and "No vision input" not in summary:
+                faces = [{"track_id": "face_0"}]
+        if world_state is not None:
+            if not getattr(world_state, "faces", []):
+                world_state.faces = faces
+        else:
+            class _WS:
+                def __init__(self, f):
+                    self.faces = f
+            world_state = _WS(faces)
+
+        decision = should_proactive_remark(
+            world_state=world_state,
+            agent_state=agent_state,
+            last_spoke_time=self._last_spoke,
+            hour_timestamps=self._hour_count,
+            min_interval_sec=self.MIN_INTERVAL,
+            max_per_hour=self.MAX_PER_HOUR,
+            only_when_seen=self.ONLY_WHEN_SEEN,
+            is_busy=is_busy,
+        )
+        if decision.allowed:
+            now = time.time()
+            self._hour_count = [t for t in self._hour_count if now - t < 3600]
+            return True
+        return False
 
     # ------------------------------------------------------------------
 

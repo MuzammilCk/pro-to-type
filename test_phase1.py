@@ -2,8 +2,8 @@ import os
 import unittest.mock as mock
 import pytest
 
-from agent import VisionAgent, VisionContext, WorldState
-from context_memory import PersonMemory, PersonaGraph, PERSONA_DIR
+from cognition.agent import VisionAgent, VisionContext, WorldState
+from memory.context_memory import PersonMemory, PersonaGraph, PERSONA_DIR
 
 
 def test_think_and_stream_response_write_gate():

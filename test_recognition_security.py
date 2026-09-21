@@ -78,7 +78,7 @@ def make_face_result(track_id="face_0", identity="unknown", authorized=False,
 
 
 def _tracker_with_track(authorized=True, identity="alice", state=None):
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     tr = FaceTracker(FakeFaceEngine())
     tr.tracks["face_0"] = {
@@ -101,7 +101,7 @@ def _tracker_with_track(authorized=True, identity="alice", state=None):
 def _shared_engine():
     global _ENGINE
     if _ENGINE is None:
-        from face_engine import FaceEngine
+        from perception.face_engine import FaceEngine
         _ENGINE = FaceEngine()
     return _ENGINE
 
@@ -195,7 +195,7 @@ def test_c_revocation_after_repeated_unknowns():
 def test_d_near_threshold_rejection():
     """score = threshold - epsilon must NOT authorize; score above
     threshold + margin must authorize (E merged with its mirror)."""
-    from face_engine import RECOGNITION_THRESHOLD, MARGIN_MIN
+    from perception.face_engine import RECOGNITION_THRESHOLD, MARGIN_MIN
     eng = _shared_engine()
     frame = np.full((240, 320, 3), 128, dtype=np.uint8)
     rng = np.random.default_rng(7)
@@ -287,7 +287,7 @@ def test_g_track_swap_no_identity_bleed():
     """Two faces crossing: Hungarian one-to-one assignment must keep each
     detection attached to its own track; no track may end up with two
     detections and none may silently swap identities."""
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     class TwoFaceEngine(FakeFaceEngine):
         """detect() returns two faces whose positions are scripted; identify()
@@ -441,7 +441,7 @@ def test_i_tracker_recognize_does_not_touch_known_faces():
 
 def test_j_same_frame_x5_rejected():
     """The old 'copy one image 5 times' enrollment must fail validation."""
-    from face_engine import ENROLL_MIN_SAMPLES
+    from perception.face_engine import ENROLL_MIN_SAMPLES
 
     if not MODELS_PRESENT:
         print("      (models not present — skipping)")
@@ -529,7 +529,7 @@ def test_j_low_quality_samples_dropped():
 def test_presence_revocation_propagates():
     """AUTHORIZED presence track whose face result arrives unauthorized
     must flip to unknown and emit person_unrecognized."""
-    from presence import PresenceManager
+    from perception.presence import PresenceManager
 
     q = queue_mod.Queue()
     pm = PresenceManager(q)
@@ -558,7 +558,7 @@ def test_presence_revocation_propagates():
 def test_presence_never_keeps_name_after_revocation():
     """Across updates, once revoked the presence track must not flip back
     to the old name without a fresh authorized result."""
-    from presence import PresenceManager
+    from perception.presence import PresenceManager
 
     q = queue_mod.Queue()
     pm = PresenceManager(q)
@@ -586,7 +586,7 @@ def test_presence_never_keeps_name_after_revocation():
 def test_assignment_is_one_to_one():
     """Two tracks + two detections: every detection maps to a distinct
     track, and a far-away detection is NOT force-assigned."""
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     tr = FaceTracker(FakeFaceEngine())
     tr.tracks["face_0"] = {"bbox": (10, 10, 60, 60), "last_seen": time.time()}
@@ -616,9 +616,9 @@ def test_moderate_head_movement_retains_track_no_spurious_left():
     cost (1.07 > 1.0) and IoU (0.11 < 0.30) thresholds, causing track swaps
     and spurious PERSON_LEFT events. Under the scoped interim fix, track ID
     is retained and PresenceManager emits no PERSON_LEFT."""
-    from presence import PresenceManager
-    from tracker import FaceTracker
-    from events import EventType
+    from perception.presence import PresenceManager
+    from perception.tracker import FaceTracker
+    from core.events import EventType
 
     class MovementEngine(FakeFaceEngine):
         def __init__(self, boxes, identify_verdicts):
@@ -713,7 +713,7 @@ def test_sustained_loss_revokes_authorization():
     """Sustained absence or non-matching face lasting longer than
     ARIA_REVOKE_WINDOW_SEC must revoke authorization — asserts that temporal
     grace expires and identity is dropped on real or mocked time advancement."""
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     tr = _tracker_with_track(authorized=True, identity="alice")
     tr.revoke_window_sec = 0.8
@@ -751,7 +751,7 @@ def test_overlapping_faces_not_merged_into_one_track():
     """Two different people with bounding boxes overlapping in the 8-20% range
     must remain separate tracks throughout tracking, and must NOT merge even
     if one detection temporarily drops for a frame."""
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     # Face A: (50, 100, 100, 100); Face B: (124, 100, 100, 100)
     # Intersection: 26x100 = 2600. Union: 17400. IoU = 14.94% (in 8-20% range).

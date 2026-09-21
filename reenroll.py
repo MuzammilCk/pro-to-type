@@ -14,7 +14,7 @@ import sys
 import cv2
 import numpy as np
 
-from face_engine import FaceEngine
+from perception.face_engine import FaceEngine
 from enroll import _collect_webcam_samples, _report
 
 

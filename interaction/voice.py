@@ -7,7 +7,7 @@ import base64
 import time as _time
 from typing import Iterator, AsyncIterator
 
-from events import Event, EventType
+from core.events import Event, EventType
 
 _SARVAM_KEY = os.getenv("SARVAM_API_KEY")
 _SARVAM_STT_WS = "wss://api.sarvam.ai/speech-to-text/ws"

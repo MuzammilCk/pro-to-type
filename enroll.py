@@ -3,7 +3,7 @@ import os
 import numpy as np
 import cv2
 
-from face_engine import FaceEngine, FACES_DIR, ENROLL_MIN_SAMPLES
+from perception.face_engine import FaceEngine, FACES_DIR, ENROLL_MIN_SAMPLES
 
 
 def _collect_webcam_samples(fe: FaceEngine, name: str, target: int = 5):

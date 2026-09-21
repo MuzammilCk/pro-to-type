@@ -12,7 +12,7 @@ import queue
 from dataclasses import dataclass, field
 from typing import Any
 
-from events import Event, EventType
+from core.events import Event, EventType
 
 
 @dataclass
@@ -36,7 +36,7 @@ class PresenceManager:
     """
 
     GREETING_COOLDOWN = 300.0  # 5 minutes — don't re-greet same person
-    UNKNOWN_GREETING_COOLDOWN = 60.0  # 1 minute — limit unknown stranger greetings session-wide
+    UNKNOWN_GREETING_COOLDOWN = 15.0  # 15 seconds — limit unknown stranger greetings session-wide
 
     def __init__(self, event_queue: queue.Queue):
         self.tracks: dict[str, TrackState] = {}

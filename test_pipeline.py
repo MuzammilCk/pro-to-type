@@ -1,7 +1,7 @@
 import cv2
-from detector import Detector
-from reasoner import Reasoner
-from alerter import Alerter
+from perception.detector import Detector
+from cognition.reasoner import Reasoner
+from actions.alerter import Alerter
 
 det = Detector("models/yolov5s.onnx")
 reasoner = Reasoner()

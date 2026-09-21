@@ -16,7 +16,7 @@ ROIs fed to the landmarker match what run.py's tracker produces.
 import numpy as np
 import cv2
 
-from face_pattern import FacePatternEngine
+from perception.face_pattern import FacePatternEngine
 
 
 def yunet_face_bbox(frame) -> tuple[int, int, int, int] | None:

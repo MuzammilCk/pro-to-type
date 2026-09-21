@@ -116,7 +116,7 @@ class StubAgent:
 
 
 def make_session(backend_reply=None):
-    from agent import VisionContext, VoiceSession
+    from cognition.agent import VisionContext, VoiceSession
 
     agent = StubAgent(backend_reply or "Here is the detailed answer you wanted. Enjoy.")
     voice = StubVoice()
@@ -130,7 +130,7 @@ def make_session(backend_reply=None):
 # ----------------------------------------------------------------------
 
 def test_sentence_splitter_basic():
-    from agent import _split_sentences
+    from cognition.agent import _split_sentences
 
     sentences, rest = _split_sentences("Hello there! How are you? I'm fine.")
     assert sentences == ["Hello there!", "How are you?", "I'm fine."]
@@ -138,7 +138,7 @@ def test_sentence_splitter_basic():
 
 
 def test_sentence_splitter_keeps_decimals():
-    from agent import _split_sentences
+    from cognition.agent import _split_sentences
 
     sentences, rest = _split_sentences("Pi is 3.14 exactly.")
     assert sentences == ["Pi is 3.14 exactly."], sentences
@@ -146,7 +146,7 @@ def test_sentence_splitter_keeps_decimals():
 
 
 def test_sentence_splitter_leaves_partial():
-    from agent import _split_sentences
+    from cognition.agent import _split_sentences
 
     sentences, rest = _split_sentences("First one. And then it kept")
     assert sentences == ["First one."]
@@ -155,7 +155,7 @@ def test_sentence_splitter_leaves_partial():
 
 def test_speech_queue_flushes_on_interrupt():
     """interrupt() must drop queued-but-unspoken sentences."""
-    from voice import SarvamVoice
+    from interaction.voice import SarvamVoice
 
     v = SarvamVoice(api_key=None)
     v._speech_queue = queue.Queue()
@@ -182,7 +182,7 @@ def test_sarvam_tts_protocol_contract():
     import asyncio
     import base64
     import json as _json
-    import voice as _voice
+    import interaction.voice as _voice
 
     sent: list[str] = []
     audio_b64 = base64.b64encode(b"\x01\x00" * 80).decode()  # 80 int16 samples
@@ -235,9 +235,9 @@ def test_sarvam_tts_protocol_contract():
 def test_local_tts_is_lock_guarded():
     """The pyttsx3 fallback must serialize through _LOCAL_TTS_LOCK — the
     'run loop already started' crash came from unsynchronized runAndWait()."""
-    import voice as _voice
+    import interaction.voice as _voice
     assert hasattr(_voice, "_LOCAL_TTS_LOCK")
-    from voice import SarvamVoice
+    from interaction.voice import SarvamVoice
     v = SarvamVoice(api_key=None)
     assert _voice._LOCAL_TTS_LOCK is not None
 
@@ -245,7 +245,7 @@ def test_local_tts_is_lock_guarded():
 def test_voicebrain_persona_in_spoken_context():
     """VoiceBrain._messages must inject persistent memory (name, traits) into
     the spoken-turn system prompt — that's the conversational-intelligence fix."""
-    from agent import VoiceBrain, VOICE_SYSTEM_PROMPT
+    from cognition.agent import VoiceBrain, VOICE_SYSTEM_PROMPT
 
     class _FakeMem:
         class persona:
@@ -269,7 +269,7 @@ def test_voicebrain_persona_in_spoken_context():
 
 
 def test_mic_vad_utterance_queue():
-    from mic_vad import MicVAD
+    from interaction.mic_vad import MicVAD
 
     mic = MicVAD()
     pcm = (np.sin(np.linspace(0, 100, 1600)) * 5000).astype(np.int16)
@@ -279,7 +279,7 @@ def test_mic_vad_utterance_queue():
 
 
 def test_mic_vad_clear_pending():
-    from mic_vad import MicVAD
+    from interaction.mic_vad import MicVAD
 
     mic = MicVAD()
     pcm = (np.ones(1600, dtype=np.int16) * 100)
@@ -290,7 +290,7 @@ def test_mic_vad_clear_pending():
 
 def test_voice_listen_uses_mic_path():
     """listen(mic=...) must use the VAD path and not interrupt in-flight TTS."""
-    from voice import SarvamVoice
+    from interaction.voice import SarvamVoice
 
     v = SarvamVoice(api_key=None)
 
@@ -314,8 +314,8 @@ def test_voice_speak_then_listen_mic_not_aborted():
     """
     import io
     import contextlib
-    from voice import SarvamVoice
-    from mic_vad import MicVAD
+    from interaction.voice import SarvamVoice
+    from interaction.mic_vad import MicVAD
 
     v = SarvamVoice(api_key=None)
     # Prevent speak() from attempting real network or local TTS playback
@@ -459,7 +459,7 @@ def test_nudge_budget():
 # ----------------------------------------------------------------------
 
 def test_vision_context_summary():
-    from agent import VisionContext
+    from cognition.agent import VisionContext
 
     vc = VisionContext()
     vc.update([], detections=None)
@@ -478,7 +478,7 @@ def test_vision_context_summary():
 
 
 def test_proactive_rate_limit():
-    from companion import ProactiveEngine
+    from cognition.companion import ProactiveEngine
 
     agent, voice, vision, session = make_session()
     engine = ProactiveEngine(agent, voice, vision, session=session)
@@ -487,7 +487,7 @@ def test_proactive_rate_limit():
 
 
 def test_proactive_silent_when_empty_room():
-    from companion import ProactiveEngine
+    from cognition.companion import ProactiveEngine
 
     agent, voice, vision, session = make_session()
     vision.update([])  # nobody in view
@@ -496,7 +496,7 @@ def test_proactive_silent_when_empty_room():
 
 
 def test_proactive_remarks_groundedin_memory():
-    from companion import ProactiveEngine
+    from cognition.companion import ProactiveEngine
 
     agent, voice, vision, session = make_session()
     mem = agent._memory_for("Sam")
@@ -558,8 +558,8 @@ def test_dialogue_loop_exits_promptly_when_room_empty():
     3 idle turns.
     """
     import threading
-    from conversation import ConversationManager
-    from agent import VisionContext, VoiceSession
+    from interaction.conversation import ConversationManager
+    from cognition.agent import VisionContext, VoiceSession
     from run import VisionAgentApp
 
     # --- stubs -------------------------------------------------------
@@ -676,7 +676,7 @@ def test_farewell_spoken_exactly_once_on_person_left():
       - neither path fires zero or two farewells
     """
     from run import VisionAgentApp
-    from events import EventType
+    from core.events import EventType
 
     # ---- minimal stand-ins -----------------------------------------------
     farewell_calls: list[str] = []
@@ -861,7 +861,7 @@ def test_farewell_dedup_suppresses_multiple_queued_events_same_identity():
     """Simulate 3 queued PERSON_LEFT events for the same identity in one departure;
     assert speak_async fires exactly once."""
     from run import VisionAgentApp
-    from events import EventType
+    from core.events import EventType
 
     farewell_calls: list[str] = []
 
@@ -932,7 +932,7 @@ def test_farewell_rearms_on_fresh_identity_confirmed():
     """Simulate departure, dedup fires, then fresh IDENTITY_CONFIRMED,
     then a second real departure — assert a second farewell DOES fire."""
     from run import VisionAgentApp
-    from events import EventType
+    from core.events import EventType
 
     farewell_calls: list[str] = []
 
@@ -1014,7 +1014,7 @@ def test_identity_confirmed_emits_only_once_for_concurrent_phantom_tracks():
     by the emit-time write to _identity_greeted added in the race fix).
     """
     import queue as qmodule
-    from presence import PresenceManager, TrackState
+    from perception.presence import PresenceManager, TrackState
 
     eq = qmodule.Queue()
     pm = PresenceManager(eq)
@@ -1064,7 +1064,7 @@ def test_should_greet_identity_level_cooldown_gates_named_phantom():
     """
     import queue as qmodule
     import time as _time
-    from presence import PresenceManager, TrackState
+    from perception.presence import PresenceManager, TrackState
 
     eq = qmodule.Queue()
     pm = PresenceManager(eq)
@@ -1102,7 +1102,7 @@ def test_session_wide_unknown_greeting_cooldown():
     """Presence: at most one unknown greeting may fire per UNKNOWN_GREETING_COOLDOWN."""
     import queue as qmodule
     import time as _time
-    from presence import PresenceManager, TrackState
+    from perception.presence import PresenceManager, TrackState
 
     eq = qmodule.Queue()
     pm = PresenceManager(eq)
@@ -1134,7 +1134,7 @@ def test_session_wide_unknown_greeting_cooldown():
 def test_farewell_suppressed_for_phantom_unknown_when_authorized_present():
     """run.py: PERSON_LEFT for an unknown track while a known user is authorized must NOT speak farewell."""
     from run import VisionAgentApp
-    from events import EventType
+    from core.events import EventType
 
     farewell_calls: list[str] = []
 
@@ -1175,7 +1175,7 @@ def test_farewell_suppressed_for_phantom_unknown_when_authorized_present():
 
 def test_unrecognized_greeting_skipped_if_authorized_present():
     """run.py: person_unrecognized must skip greeting if an authorized user is already present."""
-    from events import EventType
+    from core.events import EventType
 
     class _Tracker:
         tracks = {"face_0": {"authorized": True, "identity": "alice"}}

@@ -10,7 +10,7 @@ import os
 import numpy as np
 
 os.makedirs("faces", exist_ok=True)
-from face_engine import FaceEngine
+from perception.face_engine import FaceEngine
 
 fe = FaceEngine()
 

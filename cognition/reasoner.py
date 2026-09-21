@@ -1,5 +1,5 @@
 import numpy as np
-from detector import Detection
+from perception.detector import Detection
 
 
 class Reasoner:

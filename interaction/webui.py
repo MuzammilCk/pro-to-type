@@ -380,9 +380,11 @@ async function poll() {
   try {
     const r = await fetch("/state");
     const s = await r.json();
+    const objText = (s.status.objects && s.status.objects.length) ? " · in view: " + s.status.objects.join(", ") : "";
     document.getElementById("fps").textContent =
       (s.status.fps ? s.status.fps.toFixed(1) + " fps" : "—") +
-      (s.status.yolo ? " · yolo " + s.status.yolo : "");
+      (s.status.yolo ? " · yolo " + s.status.yolo : "") +
+      objText;
     const orb = document.getElementById("orb");
     orb.className = "orb " + s.aria_state;
     document.getElementById("state").textContent = STATE_TEXT[s.aria_state] || s.aria_state;

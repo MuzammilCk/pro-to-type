@@ -142,7 +142,7 @@ def main():
     print("  Ctrl+C   = stop")
     print("=" * 62)
 
-    import mic_vad
+    from interaction import mic_vad
     # Re-import env values (mic_vad reads env at import; we just wrote .env
     # but this process's env is stale — pass explicit values instead)
     env = {}

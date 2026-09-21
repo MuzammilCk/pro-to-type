@@ -32,21 +32,12 @@ if os.path.exists(_env_path):
 
 import numpy as np
 
-from detector import Detector
-from reasoner import Reasoner
-from alerter import Alerter
-from face_engine import FaceEngine
-from tracker import FaceTracker
-from presence import PresenceManager
-from input_source import WebcamSource
-from conversation import ConversationManager
-from agent import VisionAgent, VisionContext, VoiceSession
-from voice import SarvamVoice
-from mic_vad import MicVAD
-from companion import ProactiveEngine
-from context_memory import PersonMemory, SessionManager
-from webui import UiHub, serve, render_jpeg
-from events import Event, EventType
+from perception import Detector, FaceEngine, FaceTracker, PresenceManager, WebcamSource
+from cognition import VisionAgent, VisionContext, VoiceSession, AgentState, Reasoner, ProactiveEngine
+from interaction import ConversationManager, DialogueState, SarvamVoice, MicVAD, UiHub, serve, render_jpeg
+from memory import PersonMemory, SessionManager
+from actions import Alerter
+from core import Event, EventType
 
 
 CONFIG = {
@@ -127,6 +118,7 @@ class VisionAgentApp:
         self._yolo_every = float(os.getenv("ARIA_YOLO_EVERY_SEC", "2.0"))
         self._last_yolo = 0.0
         self._last_detections = None
+        self._last_logged_objects = None
 
     def run(self):
         httpd, _ui_t = serve(self.hub)
@@ -177,9 +169,20 @@ class VisionAgentApp:
             # Face detection/recognition still runs EVERY frame; YOLO boxes
             # are just HUD/awareness and refresh every _yolo_every seconds.
             if self._yolo_every > 0 and (t0 - self._last_yolo) >= self._yolo_every:
-                detections = self.detector.detect(frame)
+                try:
+                    detections = self.detector.detect(frame)
+                except Exception as e:
+                    print(f"[Detector] Detection warning: {e}")
+                    detections = self._last_detections or []
                 self._last_detections = detections
                 self._last_yolo = t0
+
+                # Log detected objects to console when scene changes
+                current_objects = sorted({d.label for d in (detections or []) if getattr(d, "label", "") != "person"})
+                if current_objects != self._last_logged_objects:
+                    self._last_logged_objects = current_objects
+                    if current_objects:
+                        print(f"[OBJECT] In view: {', '.join(current_objects)}")
             else:
                 detections = self._last_detections
 
@@ -238,7 +241,8 @@ class VisionAgentApp:
             self._status_text = (f"{1/avg_dt:.1f} FPS | faces={len(face_results)} | "
                                  f"tracks={self.tracker.track_count} | yolo={yolo_state}")
             self.hub.set_status({"fps": 1 / avg_dt if avg_dt else 0.0,
-                                 "yolo": yolo_state})
+                                 "yolo": yolo_state,
+                                 "objects": self._last_logged_objects or []})
 
             with self._frame_lock:
                 self._latest_frame = frame
@@ -385,10 +389,12 @@ class VisionAgentApp:
         person_unrecognized, person_left.
         Uses ConversationManager for state machine + agent for LLM reasoning.
         """
+        self.agent_state = AgentState()
         conv = ConversationManager(
             self.agent, self.voice, self.face_engine,
             vision_queue=self.action_events,
             frame_provider=self._latest_frame_now,
+            agent_state=self.agent_state,
         )
 
         # Voice session stack (talkative upgrade): VAD mic, split-brain
@@ -409,8 +415,10 @@ class VisionAgentApp:
         # Phase 2: wire voice events (USER_UTTERANCE, AGENT_*_SPEAKING) into action_events queue
         self.voice.set_event_queue(self.action_events)
         self.vision_ctx = VisionContext()
+        self.agent.attach_tools(voice=self.voice, vision_ctx=self.vision_ctx)
         self.session = VoiceSession(self.agent, self.voice, mic=self.mic,
-                                    vision=self.vision_ctx)
+                                    vision=self.vision_ctx,
+                                    agent_state=self.agent_state)
         self.proactive = ProactiveEngine(self.agent, self.voice, self.vision_ctx,
                                          session=self.session)
         self.proactive.start()
@@ -438,6 +446,16 @@ class VisionAgentApp:
                     "face_bbox": event.get("face_bbox", (0, 0, 0, 0)),
                     "score": event.get("score", 0.0),
                 }
+
+                # If dialogue is already actively running for this person, do not re-greet
+                if conv.current_identity == name and conv.state != "IDLE":
+                    self.presence.mark_greeted(track_id)
+                    continue
+
+                if not self.presence.should_greet(track_id):
+                    print(f"[Presence] Skipping duplicate greeting for {name} ({track_id!r})")
+                    continue
+
                 self.presence.mark_greeted(track_id)
 
                 # Phase 3: let the conversational brain know who showed up
@@ -445,6 +463,14 @@ class VisionAgentApp:
                     self.vision_ctx.last_known_name = name
                     self.vision_ctx.add_event(f"{name} arrived and was recognized.")
 
+                if self.agent_state is not None:
+                    self.agent_state.mode = "conversing"
+                    self.agent_state.active_person = name
+                    self.agent_state.active_goal = "chat"
+                    self.agent_state.last_activity = time.time()
+
+                conv.current_identity = name
+                conv.transition_to(DialogueState.GREETING, identity=name)
                 response, action = self.agent.think(name, face_data)
                 self._speak(response)
                 self._dialogue_loop(conv, name, face_data)
@@ -471,11 +497,11 @@ class VisionAgentApp:
                     self._speak("Hold on — I've lost track of who you are. "
                                 "Let me take a fresh look.")
 
-                # Cold-start / entry grace window: give face recognition up to 350ms to verify
+                # Cold-start / entry grace window: give face recognition up to 600ms to verify
                 # a freshly appeared track before assuming it is an unknown stranger.
                 track = self.presence.tracks.get(track_id)
-                if track and not track.authorized and (time.time() - track.first_seen < 0.35):
-                    rem = 0.35 - (time.time() - track.first_seen)
+                if track and not track.authorized and (time.time() - track.first_seen < 0.60):
+                    rem = 0.60 - (time.time() - track.first_seen)
                     if rem > 0:
                         time.sleep(rem)
 
@@ -524,6 +550,11 @@ class VisionAgentApp:
 
     def _handle_person_left(self, event: dict, conv) -> None:
         name = event.get("name") or event.get("identity", "")
+        conv_id = getattr(conv, "current_identity", None)
+        if (not name or name == "unknown") and conv_id and conv_id not in ("", "unknown"):
+            if not self._identity_currently_authorized(conv_id):
+                name = conv_id
+
         # Prefer the persona display name stored in memory over the raw
         # identity key (which may be "MuzammilCK" vs "Muzammil").
         try:
@@ -555,8 +586,46 @@ class VisionAgentApp:
             self._farewells_spoken.add(key)
             if key == "unknown":
                 self._unknown_greeted = False
+            else:
+                self._record_session_episode(name)
             self.hub.set_aria_state("idle")
             self.voice.speak_async(farewell)
+
+    def _record_session_episode(self, identity: str) -> None:
+        """Create a discrete episodic memory record for a completed session."""
+        if not identity or identity in ("", "unknown") or identity.startswith("anon_"):
+            return
+        mem_graph = getattr(self.agent, "memory", None)
+        mem = None
+        if hasattr(mem_graph, "get"):
+            mem = mem_graph.get(identity)
+        elif hasattr(self.agent, "_memory_for"):
+            mem = self.agent._memory_for(identity)
+        if not mem:
+            return
+        working = getattr(mem, "working", None)
+        if not working:
+            return
+        turns = list(getattr(working, "turns", []))
+        if not turns:
+            return
+
+        user_lines = [t.get("content", "") for t in turns if t.get("role") == "user" and t.get("content")]
+        if not user_lines:
+            return
+
+        if len(user_lines) == 1:
+            summary = f"Visited and discussed: {user_lines[0][:80]}."
+            topics = [user_lines[0][:30]]
+        else:
+            summary = f"Had a {len(turns)}-turn conversation covering: {user_lines[0][:50]}."
+            topics = [l[:30] for l in user_lines[:3]]
+
+        from memory import MemoryWriter
+        saved = MemoryWriter.record_episode(mem, summary, topics=topics)
+        if saved:
+            print(f"[Memory] Recorded session episode for {identity}: {summary}")
+        working.clear()
 
     def _identity_currently_authorized(self, identity: str) -> bool:
         """True iff some live, authorized tracker track currently carries this
@@ -596,6 +665,10 @@ class VisionAgentApp:
             conv.reset()
             self.hub.set_aria_state("idle")
             return
+
+        # Flush any audio fragments captured before or during the initial greeting playback
+        if self.mic is not None:
+            self.mic.clear_pending()
 
         idle_turns = 0
         while conv.state != "IDLE" and not self._stop.is_set():
@@ -637,6 +710,29 @@ class VisionAgentApp:
             idle_turns = 0
             if self.session is not None:
                 self.session.touch_activity()
+
+            # Dynamic authorization upgrade: if dialogue started as unknown, but a live track
+            # has now been confirmed/authorized as an enrolled identity, upgrade identity!
+            if conv.current_identity in ("", "unknown"):
+                for t in self.tracker.tracks.values():
+                    if t.get("authorized") and t.get("identity") and t.get("identity") not in ("", "unknown"):
+                        auth_id = t["identity"]
+                        print(f"[Dialogue] Upgrading dialogue identity from 'unknown' to authorized '{auth_id}'")
+                        conv.current_identity = auth_id
+                        identity = auth_id
+                        if self.agent_state:
+                            self.agent_state.active_person = auth_id
+                        # Migrate turns from unknown working memory into the enrolled person's working memory
+                        mem_graph = getattr(self.agent, "memory", None)
+                        if hasattr(mem_graph, "get"):
+                            mem_unknown = mem_graph.get("unknown")
+                            mem_auth = mem_graph.get(auth_id)
+                            if mem_unknown and mem_auth and hasattr(mem_unknown, "working") and hasattr(mem_auth, "working"):
+                                for ut in mem_unknown.working.turns:
+                                    mem_auth.working.add_turn(ut.get("role", "user"), ut.get("content", ""), ut.get("timestamp"))
+                                mem_unknown.working.clear()
+                        break
+
             _t_think_start = time.time()
             self.hub.set_aria_state("thinking")
 

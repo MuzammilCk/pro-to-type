@@ -13,7 +13,7 @@ import glob
 import numpy as np
 
 os.makedirs("faces", exist_ok=True)
-from face_engine import FaceEngine  # noqa: E402  (engine after dir creation)
+from perception.face_engine import FaceEngine  # noqa: E402  (engine after dir creation)
 
 OUT = "baseline-recognition.json"
 GENUINE_KEEP = 0.40  # sims below this on genuine pairs are flagged as outliers

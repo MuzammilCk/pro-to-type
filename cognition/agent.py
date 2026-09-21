@@ -19,8 +19,10 @@ try:
 except ImportError:
     _HAS_OLLAMA = False
 
-from context_memory import PersonMemory
-from llm_interface import OpenRouterClient, LocalFallbackLLM, BedrockLLM, _HAS_BOTO3
+from memory.context_memory import PersonMemory
+from memory import retrieve, retrieve_greeting_context, MemoryWriter
+from cognition.llm_interface import OpenRouterClient, LocalFallbackLLM, BedrockLLM, _HAS_BOTO3
+from core.tools import ToolDispatcher, strip_tool_calls
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_MODELS = [
@@ -62,10 +64,16 @@ import cv2
 class VisionAgent:
     def __init__(self):
         self.memory: dict[str, PersonMemory] = {}
+        self.dispatcher = ToolDispatcher(agent=self)
         # Select backend: Bedrock if AWS configured, OpenRouter if API key set,
         # otherwise local fallback
         self.llm, self.llm_name = self._select_backend()
         print(f"[Agent] LLM backend: {self.llm_name}")
+
+    def attach_tools(self, voice=None, vision_ctx=None):
+        """Wire voice synthesizer and vision context into the tool dispatcher."""
+        self.dispatcher.voice = voice
+        self.dispatcher.vision_ctx = vision_ctx
 
     def _select_backend(self):
         """Pick the best available LLM backend (no AWS needed for local testing)."""
@@ -112,15 +120,20 @@ class VisionAgent:
         visits = mem.interaction_count
         visit_note = f"You have met them {visits} time(s) before." if visits > 0 else "First encounter."
 
-        traits = ", ".join(mem.persona.traits) if mem.persona.traits else "no known traits yet"
-        purpose_note = f"Their stated purpose: {mem.persona.purpose}" if mem.persona.purpose else "Purpose unknown."
-        tags = ", ".join(mem.persona.tags) if mem.persona.tags else "no tags"
-
-        context_block = (
-            f"Personality context: {persona_ctx} {visit_note} "
-            f"Known traits: {traits}. {purpose_note} "
-            f"Tags: {tags}. Relationship tier: {tier}."
-        )
+        # Phase 4 selective memory retrieval
+        ret = retrieve(user_input or "", identity, mem, limit=4)
+        snippet = ret.get("context_snippet", "")
+        if snippet:
+            context_block = f"Personality context: {persona_ctx} {visit_note} {snippet}"
+        else:
+            traits = ", ".join(mem.persona.traits) if mem.persona.traits else "no known traits yet"
+            purpose_note = f"Their stated purpose: {mem.persona.purpose}" if mem.persona.purpose else "Purpose unknown."
+            tags = ", ".join(mem.persona.tags) if mem.persona.tags else "no tags"
+            context_block = (
+                f"Personality context: {persona_ctx} {visit_note} "
+                f"Known traits: {traits}. {purpose_note} "
+                f"Tags: {tags}. Relationship tier: {tier}."
+            )
 
         msgs = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context_block)}]
 
@@ -174,7 +187,10 @@ class VisionAgent:
             yield response, self._decide(identity, user_input, response)
 
         if full_response.strip():
-            mem.add_interaction("assistant", full_response.strip())
+            # Phase 6: Parse and execute tool calls
+            self.dispatcher.parse_and_execute(full_response)
+            clean_text = strip_tool_calls(full_response) or full_response
+            mem.add_interaction("assistant", clean_text.strip())
         if mem.is_dirty():
             mem.save()
 
@@ -198,10 +214,14 @@ class VisionAgent:
             response = self._fallback(identity, user_input, mem)
             action = self._decide(identity, user_input, response)
 
-        mem.add_interaction("assistant", response)
+        # Phase 6: Parse and execute tool calls
+        self.dispatcher.parse_and_execute(response)
+        clean_text = strip_tool_calls(response) or response
+
+        mem.add_interaction("assistant", clean_text)
         if mem.is_dirty():
             mem.save()
-        return response, action
+        return clean_text, action
 
     def _fallback(self, identity: str, user_input: str | None, mem: PersonMemory) -> str:
         if user_input is None and identity == "unknown":
@@ -229,7 +249,10 @@ class VisionAgent:
         if identity != "unknown":
             visits = mem.interaction_count
             greeting = "Welcome back" if visits == 0 else f"Good to see you again"
-            return f"{greeting}, {mem.persona.name or identity}! I remember our last chat about {mem.persona.purpose[:30] if mem.persona.purpose else 'our conversation'}. What's new?"
+            callback = retrieve_greeting_context(identity, mem)
+            if callback:
+                return f"{greeting}, {mem.persona.name or identity}! {callback} What's new?"
+            return f"{greeting}, {mem.persona.name or identity}! What's new today?"
         return "Is there something I can help you with?"
 
     def _decide(self, identity: str, user_input: str | None, response: str) -> str:
@@ -259,6 +282,7 @@ VOICE_SYSTEM_PROMPT = """You are ARIA's speaking voice — a warm, witty AI comp
 WHO YOU ARE
 - You have a personality: curious, playful, a little opinionated. You react like a friend who happens to live in this room.
 - You remember things about the person you're talking to — their name, past chats, small details — and bring them up naturally when relevant.
+- You have live computer vision via OpenCV! You can see who is present and what objects are nearby or being held, provided in CONTEXT FOR THIS TURN. If the person asks what they are holding or what you see, answer directly and conversationally using that visual context.
 
 SPEAKING RULES (critical — this is read aloud by TTS):
 - Reply in 1-3 short sentences the way people actually talk. Never more unless asked for detail.
@@ -311,6 +335,20 @@ class WorldState:
     objects: list[str] = field(default_factory=list)
     recent_events: list[str] = field(default_factory=list)
     last_known_name: str | None = None
+
+
+@dataclass
+class AgentState:
+    """Represents the internal operational state of the ARIA agent.
+
+    Distinct from WorldState (what ARIA observes externally in the physical world).
+    Tracks internal mode, active interlocutor, current conversational/system goal,
+    and interaction timestamp.
+    """
+    mode: str = "idle"                        # "idle", "conversing", "alert"
+    active_person: str | None = None          # Current interlocutor (e.g. "unknown", "MuzammilCK")
+    active_goal: str | None = None            # Current objective (e.g. "greet", "verify", "enroll", "chat")
+    last_activity: float = field(default_factory=time.time)
 
 
 class VisionContext:
@@ -457,7 +495,7 @@ class VoiceBrain:
         # clean 1-2 sentence spoken replies. Override with ARIA_VOICE_MODEL.
         fast_model = os.getenv("ARIA_VOICE_MODEL") or "inclusionai/ling-3.0-flash-sante:free"
         try:
-            from llm_interface import OpenRouterClient
+            from cognition.llm_interface import OpenRouterClient
             # Hermeticity guard: only attach a dedicated fast client when the
             # backend brain itself is the real OpenRouter client (production).
             # With test stubs or the offline LocalFallbackLLM, the voice brain
@@ -481,27 +519,32 @@ class VoiceBrain:
     def _persona_block(self, identity: str | None) -> str:
         """Persistent memory about this person, rendered as speakable context.
 
-        Pulled from PersonMemory (persona graph + episodic summaries) so the
-        fast spoken brain can reference past chats like a friend would. Fully
+        Pulled from PersonMemory via selective retrieval (semantic facts + episodic summaries)
+        so the fast spoken brain can reference past chats like a friend would. Fully
         defensive: any failure just means no persona block this turn.
         """
-        if not identity:
+        if not identity or identity == "unknown":
             return ""
         try:
             mem = self.agent._memory_for(identity)
+            ret = retrieve("", identity, mem, limit=3)
+            snippet = ret.get("context_snippet", "")
+            if snippet:
+                return snippet
+
+            # Legacy fallback if snippet is empty
             bits: list[str] = []
-            if mem.persona.name:
-                bits.append(f"Their name is {mem.persona.name}.")
-            if mem.interaction_count:
-                bits.append(f"You have talked {mem.interaction_count} times before.")
-            if mem.persona.traits:
-                bits.append("You remember: " + "; ".join(mem.persona.traits[:5]) + ".")
-            if mem.persona.purpose:
-                bits.append(f"They came by to: {mem.persona.purpose}.")
-            past = [e.get("summary", "") for e in mem.episodic.episodes[-3:]
-                    if isinstance(e, dict) and e.get("summary")]
-            if past:
-                bits.append("Past encounters: " + " | ".join(past))
+            persona = getattr(mem, "persona", None)
+            if persona:
+                name = getattr(persona, "name", None)
+                if name:
+                    bits.append(f"Their name is {name}.")
+                traits = getattr(persona, "traits", [])
+                if traits:
+                    bits.append("You remember: " + "; ".join(traits[:5]) + ".")
+                purpose = getattr(persona, "purpose", None)
+                if purpose:
+                    bits.append(f"They came by to: {purpose}.")
             return " ".join(bits)
         except Exception:  # noqa: BLE001 — persona must never break a spoken turn
             return ""
@@ -556,11 +599,13 @@ class VoiceSession:
     MAX_NUDGES = 1        # max nudges before ARIA stops poking the human (one-shot per idle stretch)
     CACHE_TTL = 60.0      # backend answers cached this long per question
 
-    def __init__(self, agent: "VisionAgent", voice, mic=None, vision: VisionContext | None = None):
+    def __init__(self, agent: "VisionAgent", voice, mic=None, vision: VisionContext | None = None,
+                 agent_state: AgentState | None = None):
         self.agent = agent
         self.voice = voice
         self.mic = mic
         self.vision = vision
+        self.agent_state = agent_state if agent_state is not None else AgentState()
         self.brain = VoiceBrain(agent)
         self.history: list[dict] = []
         self.busy = False
@@ -575,7 +620,10 @@ class VoiceSession:
 
     def touch_activity(self):
         """Mark real interaction (resets the nudge budget)."""
-        self.last_activity = time.time()
+        now = time.time()
+        self.last_activity = now
+        if self.agent_state is not None:
+            self.agent_state.last_activity = now
         self._nudges = 0
 
     def run_turn(self, identity: str, face_data: dict,
@@ -585,6 +633,12 @@ class VoiceSession:
             return ""
         self.busy = True
         self.pending_action = "ask"
+        if self.agent_state is not None:
+            self.agent_state.mode = "conversing"
+            self.agent_state.active_person = identity
+            self.agent_state.last_activity = time.time()
+            if not self.agent_state.active_goal:
+                self.agent_state.active_goal = "chat"
         try:
             return self._run_turn(identity, face_data, user_text, max_fillers)
         finally:
@@ -623,10 +677,13 @@ class VoiceSession:
                 pending += tok
                 sentences, pending = _split_sentences(pending)
                 for s in sentences:
-                    said_any = True
-                    self.voice.enqueue_speech(s)
+                    clean_s = strip_tool_calls(s)
+                    if clean_s:
+                        said_any = True
+                        self.voice.enqueue_speech(clean_s)
             if not self.brain.delegated and pending.strip():
-                tail = pending.replace("[", "").replace("]", "").strip()
+                clean_pending = strip_tool_calls(pending)
+                tail = clean_pending.replace("[", "").replace("]", "").strip()
                 if tail:
                     said_any = True
                     self.voice.enqueue_speech(tail)
@@ -637,7 +694,9 @@ class VoiceSession:
         if self.brain.delegated:
             full = self._backend_deliver(identity, face_data, user_text, said_any)
         else:
-            full = voice_full.replace("[", "").replace("]", "").strip()
+            if self.agent and hasattr(self.agent, "dispatcher"):
+                self.agent.dispatcher.parse_and_execute(voice_full)
+            full = strip_tool_calls(voice_full).replace("[", "").replace("]", "").strip()
             self._record(identity, full)
 
         self.history.append({"role": "user", "content": user_text or "(arrived)"})
@@ -648,8 +707,12 @@ class VoiceSession:
         if any(k in low for k in ("enroll", "look at the camera", "now authorized",
                                   "register you", "save your face")):
             self.pending_action = "enroll"
+            if self.agent_state is not None:
+                self.agent_state.active_goal = "enroll"
         elif any(k in low for k in ("alert", "security", "escalat")):
             self.pending_action = "alert"
+            if self.agent_state is not None:
+                self.agent_state.active_goal = "alert"
         return full
 
     # ------------------------------------------------------------------
@@ -706,12 +769,19 @@ class VoiceSession:
     # ------------------------------------------------------------------
 
     def maybe_nudge(self, identity: str, face_data: dict) -> bool:
-        """Speak a gentle nudge after long silence (rate-limited)."""
-        if self.busy:
-            return False
+        """Speak a gentle nudge after long silence (rate-limited via policy.should_nudge)."""
+        from core.policy import should_nudge
         with self._nudge_lock:
             idle = time.time() - self.last_activity
-            if idle < self.NUDGE_MINUTES * 60 or self._nudges >= self.MAX_NUDGES:
+            decision = should_nudge(
+                agent_state=self.agent_state,
+                idle_seconds=idle,
+                nudges_done=self._nudges,
+                nudge_threshold_sec=self.NUDGE_MINUTES * 60,
+                max_nudges=self.MAX_NUDGES,
+                is_busy=self.busy,
+            )
+            if not decision.allowed:
                 return False
             self._nudges += 1
             self.last_activity = time.time()

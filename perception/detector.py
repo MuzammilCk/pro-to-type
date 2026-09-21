@@ -30,7 +30,7 @@ class Detector:
             "sandwich", "orange", "broccoli", "carrot", "hot dog",
             "pizza", "donut", "cake", "chair", "couch", "potted plant",
             "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-            "keyboard", "cell phone", "microwave", "oven", "toaster",
+            "remote", "keyboard", "cell phone", "microwave", "oven", "toaster",
             "sink", "refrigerator", "book", "clock", "vase", "scissors",
             "teddy bear", "hair drier", "toothbrush",
         ]
@@ -58,7 +58,8 @@ class Detector:
             y = int(cy - h / 2)
             boxes.append((x, y, int(w), int(h)))
             scores.append(class_conf)
-            labels.append(self.class_names[class_id])
+            label = self.class_names[class_id] if 0 <= class_id < len(self.class_names) else f"object_{class_id}"
+            labels.append(label)
 
         indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.25, nms_threshold=0.45)
         indices = np.asarray(indices).flatten().astype(int)

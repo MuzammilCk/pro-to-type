@@ -14,7 +14,7 @@ import threading
 import time
 import queue as queue_mod
 import os
-from events import EventType
+from core.events import EventType
 
 import numpy as np
 
@@ -49,7 +49,7 @@ class FakeAgent:
     """Minimal stand-in for VisionAgent."""
 
     def __init__(self):
-        from context_memory import PersonMemory
+        from memory.context_memory import PersonMemory
         self.memory = {}
 
     def _memory_for(self, identity):
@@ -102,8 +102,8 @@ def make_face_result(track_id="face_0", identity="alice", authorized=True,
 # ----------------------------------------------------------------------
 
 def test_b1_greeting_spoken_exactly_once():
-    from conversation import ConversationManager
-    from context_memory import SessionManager
+    from interaction.conversation import ConversationManager
+    from memory.context_memory import SessionManager
 
     # Keep the checkpoint hermetic — no persona/ writes during the test
     SessionManager.save_current_state = staticmethod(lambda identities: None)
@@ -154,7 +154,7 @@ def test_b3_name_extraction():
 # ----------------------------------------------------------------------
 
 def test_b8_update_results_no_second_detection():
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     calls = {"detect": 0}
 
@@ -188,7 +188,7 @@ def test_b8_update_results_no_second_detection():
 # ----------------------------------------------------------------------
 
 def _tracker_with_track(authorized=True):
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     eng = FakeFaceEngine()
     tr = FaceTracker(eng, miss_limit=2, hysteresis_margin=0.08)
@@ -292,7 +292,7 @@ def _shared_engine():
     """One real FaceEngine for all contract tests (model load is slow)."""
     global _ENGINE
     if _ENGINE is None:
-        from face_engine import FaceEngine
+        from perception.face_engine import FaceEngine
         _ENGINE = FaceEngine()
     return _ENGINE
 
@@ -437,7 +437,7 @@ def test_b9_rematch_clears_streak():
 # ----------------------------------------------------------------------
 
 def test_b9_identity_cooldown_suppresses_reentry_greeting():
-    from presence import PresenceManager
+    from perception.presence import PresenceManager
 
     q = queue_mod.Queue()
     pm = PresenceManager(q)
@@ -465,7 +465,7 @@ def test_b9_identity_cooldown_suppresses_reentry_greeting():
 
 
 def test_b9_identity_cooldown_expires():
-    from presence import PresenceManager
+    from perception.presence import PresenceManager
 
     q = queue_mod.Queue()
     pm = PresenceManager(q)
@@ -489,7 +489,7 @@ def test_b9_identity_cooldown_expires():
 
 def test_presence_unknown_reentry_still_greeted():
     """Unknown visitors must still trigger a conversation on re-entry."""
-    from presence import PresenceManager
+    from perception.presence import PresenceManager
 
     q = queue_mod.Queue()
     pm = PresenceManager(q)
@@ -510,7 +510,7 @@ def test_presence_unknown_reentry_still_greeted():
 # ----------------------------------------------------------------------
 
 def test_voice_interrupt_bumps_generation():
-    from voice import SarvamVoice
+    from interaction.voice import SarvamVoice
 
     v = SarvamVoice(api_key=None)  # forces the print-TTS path, no network
     gen_before = v._tts_gen
@@ -520,7 +520,7 @@ def test_voice_interrupt_bumps_generation():
 
 
 def test_voice_speak_captures_generation_after_interrupt():
-    from voice import SarvamVoice
+    from interaction.voice import SarvamVoice
 
     v = SarvamVoice(api_key=None)
     captured = {}
@@ -552,7 +552,7 @@ def test_b10_tracker_rescales_landmarks_to_full_resolution():
     enrolled faces scored ~0.28 against their own templates (threshold 0.36)
     — authorized faces were never recognized live.
     """
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     LM = [30.0, 40.0, 50.0, 40.0, 40.0, 50.0, 30.0, 60.0, 50.0, 60.0]
 
@@ -582,7 +582,7 @@ def test_b10_recognize_faces_pads_missing_landmarks():
     Regression: [x,y,w,h] + [] built a 4-element row, and SFace's alignCrop
     silently mis-cropped it, producing a non-face embedding.
     """
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     seen = {}
 
@@ -627,7 +627,7 @@ def test_b10_engine_rejects_garbage_landmark_rows():
         print("      (models not present — skipping)")
         return
 
-    from face_engine import FaceEngine
+    from perception.face_engine import FaceEngine
 
     fe = FaceEngine()
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -645,7 +645,7 @@ def test_b10_quality_uses_detection_score_not_eye_x():
     face[4] is the right-eye X coordinate (an int, often > 1.0), which made
     conf_score clamp to 1.0 for every face and quality worthless.
     """
-    from face_engine import FaceEngine
+    from perception.face_engine import FaceEngine
 
     fe = FaceEngine()
     frame = np.full((240, 320, 3), 128, dtype=np.uint8)
@@ -697,7 +697,7 @@ def test_b11_ghost_track_absorbed_no_duplicate_pattern():
     moved further than dist_threshold, the old track was kept as a ghost AND
     a new track spawned — the landmark mesh drew twice for one person.
     """
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     # 300x300 face (typical close-up webcam box), moved 120px between
     # frames: centroid dist 120 > dist_threshold (100) so centroid matching
@@ -731,7 +731,7 @@ def test_b11_ghost_track_absorbed_no_duplicate_pattern():
 
 def test_b11_ghost_dropped_when_twin_is_matched_track():
     """A ghost overlapping a track that was matched this frame is dropped."""
-    from tracker import FaceTracker
+    from perception.tracker import FaceTracker
 
     script = [
         [(10, 10, 300, 300)],  # face_0 created
@@ -767,7 +767,7 @@ def test_b12_anon_persona_roundtrip():
     save(identity="unknown") does NOT write anon_<date>.json; load("unknown")
     always returns a fresh unpersisted instance.
     """
-    import context_memory
+    import memory.context_memory as context_memory
 
     today = context_memory.datetime.datetime.now().strftime("%Y%m%d")
     anon_path = os.path.join(context_memory.PERSONA_DIR, f"anon_{today}.json")

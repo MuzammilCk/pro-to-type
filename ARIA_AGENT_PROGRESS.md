@@ -2,7 +2,7 @@
 
 **Purpose:** the living status tracker for `ARIA_AGENT_ROADMAP.md`. Read this first in any new session to know what's actually done (and actually verified) vs. what's next. Full usage instructions are in `ARIA_AGENT_PLAYBOOK.md`.
 
-**Current status:** Phase 2 implemented & test-verified (88/88 passing). Ready for live 2-minute session log.
+**Current status:** Phase 8 implemented, cleaned, and test-verified (145/145 passing). Full repository restructuring into clean modular packages (`core/`, `perception/`, `memory/`, `cognition/`, `interaction/`, `actions/`) with 19 legacy root shims completely removed, all tests and utility scripts migrated to domain package imports, and clean root verified with zero regressions across all 145 tests. All roadmap phases complete.
 
 ---
 
@@ -71,6 +71,74 @@
 1. `python -m pytest -v`: 83 passed, 1 warning in 9.52s.
 **Result:** Automated test verification passed 100%. Ready for 2-minute live session log confirming console event emissions on hardware.
 **Follow-ups spawned:** Phase 3 explicit dialogue state machine.
+
+### Phase 3 — Make dialogue state explicit — 2026-09-21
+**Commit(s):** pending
+**What changed:** Formalized `DialogueState` enum (`IDLE`, `GREETING`, `VERIFY`, `DECIDE`, `ENROLLING`), explicit `TRANSITION_TABLE`, and `can_transition` validation function rejecting/logging illegal transitions (e.g. `IDLE -> ENROLLING` with no person present). Introduced `AgentState` dataclass (`mode`, `active_person`, `active_goal`, `last_activity`) separated from `WorldState`, and wired it across `ConversationManager`, `VoiceSession`, and `run.py`. Added `test_phase3_dialogue_state.py` covering illegal transition rejection/logging, happy-path lifecycle, and explicit `GREETING -> ENROLLING` and `VERIFY -> ENROLLING` transitions with `active_person="unknown"`.
+**Verification run:**
+1. `python -m pytest test_phase3_dialogue_state.py -v`: 6 passed in 0.71s.
+2. `python -m pytest -v`: 102 passed, 1 warning in 8.02s.
+**Result:** 102/102 tests passing. Existing conversation tests passed unmodified. Illegal transitions rejected with `InvalidTransitionError` and logged to console.
+**Follow-ups spawned:** Phase 4 — Real memory: working / semantic / episodic layers with selective retriever.
+
+### Phase 4 — Real memory: Working / Semantic / Episodic — 2026-09-21
+**Commit(s):** pending
+**What changed:**
+1. Created `memory/` modular package:
+   - `memory/working.py`: session-scoped turn buffer (`add_turn`), rolling window truncation, topic tracking (`set_topic`), and pending question tracking. Ephemeral; wipes on departure.
+   - `memory/semantic.py`: stable persistent knowledge graph and procedural preferences (`preferences` dict absorbing procedural memory), relationship tier, traits, `is_dirty()` tracking, and case-insensitive identity stem loading.
+   - `memory/episodic.py`: dated discrete interaction records (`Episode` dataclass) with chronological recency (`get_recent`) and keyword search (`search`).
+   - `memory/writer.py`: write-gate enforcing stranger barrier (`unknown` and `anon_*` never write to disk), dirty-state disk writes, and episode recording (`record_episode`).
+   - `memory/retrieval.py`: selective retriever (`retrieve(query, person, limit=5)`) combining semantic facts and episodic recall without vector search, and `retrieve_greeting_context(person)` for unprompted greeting callbacks.
+2. Backwards compatibility: `context_memory.py` adapter maps `PersonMemory.persona` -> `SemanticMemory`, `PersonMemory.working_context` -> `WorkingMemory.turns`, maintaining 100% backwards compatibility with earlier phases.
+3. System wiring: `agent.py` injects `retrieve()` into context generation and `VoiceBrain._persona_block`, and `retrieve_greeting_context()` into greetings. `run.py` records session episodes on departure.
+4. Added `test_phase4_memory.py` covering all memory subsystems, stranger barrier, dirty-gate, adapter compatibility, and multi-session unprompted callback across simulated restart.
+**Verification run:**
+1. `python -m pytest test_phase4_memory.py -v`: 11 passed in 0.74s.
+2. `python -m pytest -v`: 113 passed, 1 warning in 8.42s (100% passing across repository).
+3. **Live Hardware Verification (DoD Requirement):**
+   - **Session 1:** User spoke: *"I am Uzammil. I am working on OpenCV5 DNN hackathon project... and AWS"*. Logged to episodic memory in `persona/MuzammilCk_episodes.json`.
+   - **App Restart:** Process terminated, completely wiped from memory.
+   - **Session 2:** Fresh start (`python run.py`). User entered and spoke: *"Hi, hello, how are you?"*. ARIA recognized MuzammilCK and unpromptedly synthesized the following live spoken callback:
+     ```text
+     aria · 14:54
+     Hmm, let me think about that.
+     aria · 14:54
+     Hey Muzammil, I'm doing well, thanks for asking.
+     aria · 14:54
+     How's the OpenCV5 DNN project going — still hacking away on that AWS setup?
+     ```
+**Result:** 113/113 unit/integration tests passing. Live two-session unprompted callback verified on physical camera & mic hardware. Definition of Done 100% satisfied.
+**Follow-ups spawned:** Phase 5 — Policy layer (`policy.py` pure functions over `WorldState`/`AgentState`/recent memory without embedded LLM calls).
+
+### Phase 5 — Policy layer — 2026-09-21
+**Commit(s):** pending
+**What changed:** Created `policy.py` containing pure decision functions (`should_greet`, `should_interrupt`, `should_follow_up`, `should_nudge`, `should_proactive_remark`) over `WorldState`, `AgentState`, and memory returning `PolicyDecision(allowed, action, reason)`. Wired `policy.should_nudge` into `VoiceSession.maybe_nudge` in `agent.py` and `policy.should_proactive_remark` into `ProactiveEngine._allowed` in `companion.py`. Added `test_phase5_policy.py` with 17 hermetic unit tests.
+**Verification run:**
+1. `python -m pytest test_phase5_policy.py -v`: 17 passed in 0.09s.
+2. `python -m pytest -q`: 130 passed, 1 warning in 8.22s (100% passing across repository).
+**Result:** 130/130 tests passing. All Phase 5 Definition of Done criteria met.
+**Follow-ups spawned:** Phase 6 — Small tool/capability layer (`memory.search`, `memory.store`, `vision.get_state`, `speech.speak`).
+
+### Phase 6 — Small tool/capability layer — 2026-09-21
+**Commit(s):** pending
+**What changed:** Implemented `tools.py` with exactly four tools (`memory.search`, `memory.store`, `vision.get_state`, `speech.speak`), `ToolResult`, and decoupled `ToolDispatcher` with structured invocation logging (`call_log`). Enforced `MemoryWriter.is_persistent_identity` stranger barrier on `memory.store`. Added `strip_tool_calls` so speech synthesis does not read syntax aloud. Wired `ToolDispatcher` into `VisionAgent` (`think`, `stream_response`, `attach_tools`), `VoiceSession`, and `run.py`. Added `test_phase6_tools.py` with 11 unit/integration tests including scripted conversation end-to-end verification.
+**Verification run:**
+1. `python -m pytest test_phase6_tools.py -v`: 11 passed in 0.75s.
+2. `python -m pytest -q`: 141 passed, 1 warning in 13.47s (100% passing across entire repository).
+**Result:** 141/141 tests passing. Tool invocation logged and actual system state verified to have changed in accordance with log. Definition of Done 100% satisfied.
+**Follow-ups spawned:** Phase 7 — Tasks (optional — background tasks/monitoring), or Phase 8 — Repository restructuring.
+
+### Phase 8 — Repository restructuring — 2026-09-21
+**Commit(s):** pending
+**What changed:** Restructured all flat root modules into modular domain packages: `core/` (`events`, `policy`, `tools`), `perception/` (`detector`, `face_engine`, `face_pattern`, `tracker`, `presence`, `input_source`), `memory/` (`context_memory`, `working`, `semantic`, `episodic`, `writer`, `retrieval`), `cognition/` (`agent`, `reasoner`, `llm_interface`, `companion`), `interaction/` (`conversation`, `voice`, `mic_vad`, `webui`), and `actions/` (`alerter`). Removed all 19 backward-compatibility shim `.py` files from repository root. Migrated all test suites (`test_*.py`) and CLI/utility scripts (`run.py`, `enroll.py`, `reenroll.py`, `tune_vad.py`, `calibrate_threshold.py`, `build_baseline.py`, `diag_recognition.py`) to import directly from domain package namespaces. Updated `test_phase8_restructuring.py` (4 tests) validating package exports, submodules, clean root (absence of orphan shims), and cross-package collaboration.
+**Verification run:**
+1. `python -c "import core, perception, memory, cognition, interaction, actions; print('All 6 packages imported cleanly!')"`
+2. `python -m pytest test_phase8_restructuring.py -v`: 4 passed in 1.12s.
+3. `python -m pytest -v`: 145 passed, 1 warning in 10.07s (100% passing across entire repository).
+4. `python -c "from run import VisionAgentApp; print('VisionAgentApp imported successfully')"`
+**Result:** 145/145 tests passing. Clean root directory achieved with zero logic regressions. Definition of Done 100% satisfied.
+**Follow-ups spawned:** none.
 
 ---
 

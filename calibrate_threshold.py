@@ -26,7 +26,7 @@ import os
 
 import numpy as np
 
-from face_engine import FaceEngine, FACES_DIR
+from perception.face_engine import FaceEngine, FACES_DIR
 
 
 def load_templates():

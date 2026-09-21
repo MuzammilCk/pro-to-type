@@ -17,7 +17,7 @@ import urllib.request
 
 import numpy as np
 
-from webui import UiHub, render_jpeg, serve
+from interaction.webui import UiHub, render_jpeg, serve
 
 
 def test_transcript_ordering_and_roles():
